@@ -41,7 +41,7 @@ dependencies = [
     "email-validator==2.3.0",
     "fastapi==0.136.3",
     "fastapi-cli==0.0.29",
-    "fastapi-cloud-cli==0.22.1",
+    "fastapi-cloud-cli==0.22.2",
     "fastar==0.11.0",
     "fastsafetensors==0.3.3",
     "filelock==3.29.7",
@@ -88,9 +88,11 @@ dependencies = [
     "numpy==2.3.5",
     "nvidia-cublas-cu12==12.9.1.4",
     "nvidia-cuda-cccl==13.3.3.4.1",
+    "nvidia-cuda-cccl-cu12==12.9.27",
     "nvidia-cuda-crt==13.3.73",
     "nvidia-cuda-cupti-cu12==12.9.79",
     "nvidia-cuda-nvcc==13.2.78",
+    "nvidia-cuda-nvcc-cu12==12.9.86",
     "nvidia-cuda-nvrtc==13.3.33",
     "nvidia-cuda-nvrtc-cu12==12.9.86",
     "nvidia-cuda-runtime==13.3.29",
@@ -190,7 +192,7 @@ dependencies = [
     "urllib3==2.7.0",
     "uvicorn==0.51.0",
     "uvloop==0.22.1",
-    "vllm==0.24.0",
+    "vllm",
     "watchfiles==1.2.0",
     "websockets==16.1",
     "xgrammar==0.2.3",
@@ -212,3 +214,4 @@ explicit = true
 torch = { index = "pytorch-cu129" }
 torchaudio = { index = "pytorch-cu129" }
 torchvision = { index = "pytorch-cu129" }
+vllm = { url = "https://wheels.vllm.ai/ee0da84ab9e04ac7610e28580af62c365e898389/vllm-0.24.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl" }
