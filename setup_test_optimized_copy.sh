@@ -26,7 +26,6 @@ VLLM_PID=""
 APP_PID=""
 MODEL_DOWNLOAD_PID=""
 UV_SYNC_PID=""
-STREAMED_PROCESS_PID=""
 INSTALL_TEMP_DIR=""
 CLEANED_UP=0
 APT_UPDATED=0
@@ -104,27 +103,6 @@ process_group_is_alive() {
     local pid=$1
     [[ -n "$pid" ]] || return 1
     kill -0 -- "-$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null
-}
-
-start_streamed_process() {
-    local label=$1
-    local log_file=$2
-    shift 2
-
-    : >"$log_file"
-    setsid bash -o pipefail -c '
-        label=$1
-        log_file=$2
-        shift 2
-
-        stdbuf -oL -eL "$@" 2>&1 \
-            | awk -v prefix="[$label] " '\''
-                BEGIN { RS = "\r|\n"; ORS = "\n" }
-                length($0) { print prefix $0; fflush() }
-            '\'' \
-            | tee -a "$log_file"
-    ' bash "$label" "$log_file" "$@" &
-    STREAMED_PROCESS_PID=$!
 }
 
 cleanup() {
@@ -399,10 +377,10 @@ install_uv() {
 }
 
 start_uv_sync() {
-    log "Starting locked Python dependency synchronization in the background; live output is labeled [uv sync]..."
-    start_streamed_process "uv sync" "$UV_SYNC_LOG" \
-        uv --verbose sync --frozen
-    UV_SYNC_PID=$STREAMED_PROCESS_PID
+    log "Starting locked Python dependency synchronization in the background..."
+    rm -f "$UV_SYNC_LOG"
+    setsid stdbuf -oL -eL uv sync --frozen >"$UV_SYNC_LOG" 2>&1 &
+    UV_SYNC_PID=$!
 }
 
 finish_uv_sync() {
@@ -518,9 +496,9 @@ start_model_download() {
         return
     fi
 
-    log "Starting $MODEL_WEIGHTS download in the background with $HTTP_CONNECTIONS resumable HTTP ranges; live output is labeled [model download]..."
-    start_streamed_process "model download" "$MODEL_DOWNLOAD_LOG" \
-        aria2c \
+    log "Starting $MODEL_WEIGHTS download in the background with $HTTP_CONNECTIONS resumable HTTP ranges..."
+    rm -f "$MODEL_DOWNLOAD_LOG"
+    setsid aria2c \
         -x "$HTTP_CONNECTIONS" \
         -s "$HTTP_CONNECTIONS" \
         -k 1M \
@@ -532,14 +510,14 @@ start_model_download() {
         --connect-timeout=30 \
         --timeout=60 \
         --console-log-level=warn \
-        --show-console-readout=true \
-        --summary-interval=5 \
+        --show-console-readout=false \
+        --summary-interval=30 \
         --auto-file-renaming=false \
         --allow-overwrite=true \
         --dir="$LOCAL_MODEL_DIR" \
         --out="$MODEL_WEIGHTS" \
-        "$model_url"
-    MODEL_DOWNLOAD_PID=$STREAMED_PROCESS_PID
+        "$model_url" >"$MODEL_DOWNLOAD_LOG" 2>&1 &
+    MODEL_DOWNLOAD_PID=$!
 }
 
 finish_model_download() {
