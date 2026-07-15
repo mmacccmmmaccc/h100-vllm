@@ -124,10 +124,12 @@ esac
 [[ "$(uname -m)" == "x86_64" ]] || die "This CUDA installer currently supports x86_64 only."
 
 ensure_download_tools() {
-    if ! command -v curl >/dev/null 2>&1 || ! command -v wget >/dev/null 2>&1; then
+    if ! command -v curl >/dev/null 2>&1 \
+        || ! command -v wget >/dev/null 2>&1 \
+        || ! command -v aria2c >/dev/null 2>&1; then
         log "Installing download prerequisites..."
         as_root apt-get update
-        apt_install ca-certificates curl wget
+        apt_install aria2 ca-certificates curl wget
     fi
 }
 
@@ -157,9 +159,11 @@ install_cuda_and_cudnn() {
     local cudnn_repo_name="cudnn-local-repo-${CUDA_REPO_DISTRO}-${CUDNN_VERSION}"
     local cudnn_repo_deb="${cudnn_repo_name}_1.0-1_amd64.deb"
     local download_dir
+    local installer_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/h100-vllm/installers"
     local keyring
     download_dir="$(mktemp -d)"
     INSTALL_TEMP_DIR="$download_dir"
+    mkdir -p "$installer_cache_dir"
 
     wget -qO "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
         "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_REPO_DISTRO}/x86_64/cuda-${CUDA_REPO_DISTRO}.pin"
@@ -171,9 +175,18 @@ install_cuda_and_cudnn() {
         && [[ -d "/var/$repo_name" ]]; then
         log "Reusing the existing CUDA local repository in /var/$repo_name."
     else
-        wget -qO "$download_dir/$repo_deb" \
+        aria2c \
+            -x 8 \
+            -s 8 \
+            -k 4M \
+            -c \
+            --auto-file-renaming=false \
+            --allow-overwrite=true \
+            --dir="$installer_cache_dir" \
+            --out="$repo_deb" \
             "https://developer.download.nvidia.com/compute/cuda/${CUDA_RELEASE}/local_installers/${repo_deb}"
-        as_root dpkg -i "$download_dir/$repo_deb"
+        as_root dpkg -i "$installer_cache_dir/$repo_deb"
+        rm -f "$installer_cache_dir/$repo_deb" "$installer_cache_dir/${repo_deb}.aria2"
     fi
 
     keyring="$(find "/var/$repo_name" -maxdepth 1 -type f -name 'cuda-*-keyring.gpg' -print -quit)"
@@ -184,9 +197,18 @@ install_cuda_and_cudnn() {
         && [[ -d "/var/$cudnn_repo_name" ]]; then
         log "Reusing the existing cuDNN local repository in /var/$cudnn_repo_name."
     else
-        wget -qO "$download_dir/$cudnn_repo_deb" \
+        aria2c \
+            -x 8 \
+            -s 8 \
+            -k 4M \
+            -c \
+            --auto-file-renaming=false \
+            --allow-overwrite=true \
+            --dir="$installer_cache_dir" \
+            --out="$cudnn_repo_deb" \
             "https://developer.download.nvidia.com/compute/cudnn/${CUDNN_VERSION}/local_installers/${cudnn_repo_deb}"
-        as_root dpkg -i "$download_dir/$cudnn_repo_deb"
+        as_root dpkg -i "$installer_cache_dir/$cudnn_repo_deb"
+        rm -f "$installer_cache_dir/$cudnn_repo_deb" "$installer_cache_dir/${cudnn_repo_deb}.aria2"
     fi
 
     keyring="$(find "/var/$cudnn_repo_name" -maxdepth 1 -type f -name 'cudnn-*-keyring.gpg' -print -quit)"
