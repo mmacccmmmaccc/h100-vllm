@@ -3,6 +3,8 @@
 set -Eeuo pipefail
 
 CUDA_VERSION="12.9"
+CUDA_RELEASE="12.9.1"
+CUDA_LOCAL_REPO_VERSION="12.9.1-575.57.08-1"
 FFMPEG_VERSION="7.1.5"
 MODEL="prithivMLmods/gemma-4-E4B-it-FP8"
 VLLM_PORT="8080"
@@ -141,15 +143,34 @@ install_cuda_and_cudnn() {
     fi
 
     ensure_download_tools
-    log "Installing CUDA Toolkit $CUDA_VERSION and cuDNN 9 from NVIDIA's Ubuntu repository..."
+    log "Installing CUDA Toolkit $CUDA_VERSION and cuDNN 9 from NVIDIA's local DEB repository..."
+
+    local repo_name="cuda-repo-${CUDA_REPO_DISTRO}-12-9-local"
+    local repo_deb="${repo_name}_${CUDA_LOCAL_REPO_VERSION}_amd64.deb"
+    local download_dir
     local keyring
-    keyring="$(mktemp --suffix=.deb)"
-    wget -qO "$keyring" \
-        "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_REPO_DISTRO}/x86_64/cuda-keyring_1.1-1_all.deb"
-    as_root dpkg -i "$keyring"
-    rm -f "$keyring"
+    download_dir="$(mktemp -d)"
+
+    wget -qO "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
+        "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_REPO_DISTRO}/x86_64/cuda-${CUDA_REPO_DISTRO}.pin"
+    as_root install -m 644 \
+        "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
+        /etc/apt/preferences.d/cuda-repository-pin-600
+
+    wget -qO "$download_dir/$repo_deb" \
+        "https://developer.download.nvidia.com/compute/cuda/${CUDA_RELEASE}/local_installers/${repo_deb}"
+    as_root dpkg -i "$download_dir/$repo_deb"
+
+    keyring="$(find "/var/$repo_name" -maxdepth 1 -type f -name 'cuda-*-keyring.gpg' -print -quit)"
+    [[ -n "$keyring" ]] || die "CUDA local repository keyring was not found in /var/$repo_name."
+    as_root cp "$keyring" /usr/share/keyrings/
+
     as_root apt-get update
     apt_install "cuda-toolkit-12-9" "cudnn9-cuda-12"
+
+    as_root env DEBIAN_FRONTEND=noninteractive apt-get remove -y --purge "$repo_name"
+    as_root rm -f /etc/apt/preferences.d/cuda-repository-pin-600
+    rm -rf "$download_dir"
 
     [[ -x "/usr/local/cuda-$CUDA_VERSION/bin/nvcc" ]] || die "CUDA installation completed, but nvcc was not found."
 }
