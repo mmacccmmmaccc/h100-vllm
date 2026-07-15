@@ -92,10 +92,18 @@ cleanup() {
     exit "$status"
 }
 
+handle_signal() {
+    local signal=$1
+    local status=$2
+
+    log "Received $signal; stopping setup and child processes..."
+    exit "$status"
+}
+
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
+trap 'handle_signal INT 130' INT
+trap 'handle_signal TERM 143' TERM
+trap 'handle_signal HUP 129' HUP
 
 if (( $# != 1 )) || [[ -z "$1" ]]; then
     die "Usage: bash setup.sh <hugging-face-token>"
@@ -104,7 +112,8 @@ fi
 HF_TOKEN=$1
 export HF_TOKEN
 export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
-export HF_HUB_DISABLE_XET=1
+# Ensure Hugging Face uses the installed hf-xet client for model downloads.
+unset HF_HUB_DISABLE_XET
 set --
 
 [[ -r /etc/os-release ]] || die "This installer requires an Ubuntu system with apt."
@@ -180,6 +189,8 @@ install_cuda_and_cudnn() {
             -s 8 \
             -k 4M \
             -c \
+            --console-log-level=warn \
+            --summary-interval=1 \
             --auto-file-renaming=false \
             --allow-overwrite=true \
             --dir="$installer_cache_dir" \
@@ -202,6 +213,8 @@ install_cuda_and_cudnn() {
             -s 8 \
             -k 4M \
             -c \
+            --console-log-level=warn \
+            --summary-interval=1 \
             --auto-file-renaming=false \
             --allow-overwrite=true \
             --dir="$installer_cache_dir" \
@@ -306,7 +319,7 @@ setsid stdbuf -oL -eL uv run vllm serve "$MODEL" \
     --max-model-len 8192 \
     --limit-mm-per-prompt.audio 1 \
     --mm-processor-kwargs.audio_kwargs.max_length 480000 \
-    --gpu-memory-utilization 0.9
+    --gpu-memory-utilization 0.9 \
     --uvicorn-log-level trace &
 VLLM_PID=$!
 
