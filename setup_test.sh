@@ -8,17 +8,22 @@ CUDA_LOCAL_REPO_VERSION="12.9.1-575.57.08-1"
 CUDNN_VERSION="9.17.1"
 FFMPEG_VERSION="7.1.5"
 MODEL="prithivMLmods/gemma-4-E4B-it-FP8"
+MODEL_REVISION="main"
+MODEL_WEIGHTS="model.safetensors"
+MODEL_WEIGHTS_SIZE="13309692724"
 VLLM_PORT="8080"
 APP_PORT="7000"
+HTTP_CONNECTIONS="8"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE_DIR="$SCRIPT_DIR/vllm_engine"
+LOCAL_MODEL_DIR="$ENGINE_DIR/models/${MODEL//\//--}"
 VLLM_PID=""
 APP_PID=""
 INSTALL_TEMP_DIR=""
 CLEANED_UP=0
 STEP_CURRENT=0
-STEP_TOTAL=7
+STEP_TOTAL=8
 
 log() {
     printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
@@ -139,8 +144,11 @@ fi
 HF_TOKEN=$1
 export HF_TOKEN
 export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
-# Ensure Hugging Face uses the installed hf-xet client for model downloads.
-unset HF_HUB_DISABLE_XET
+# Force the stable regular-HTTP path; hf-xet 1.5.2rc0 repeatedly stalled while
+# decoding response bodies for this model, even with reduced concurrency.
+export HF_HUB_DISABLE_XET=1
+unset HF_XET_NUM_CONCURRENT_RANGE_GETS
+unset HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY
 set --
 
 [[ -r /etc/os-release ]] || die "This installer requires an Ubuntu system with apt."
@@ -212,10 +220,16 @@ install_cuda_and_cudnn() {
         log "Reusing the existing CUDA local repository in /var/$repo_name."
     else
         aria2c \
-            -x 8 \
-            -s 8 \
-            -k 4M \
+            -x "$HTTP_CONNECTIONS" \
+            -s "$HTTP_CONNECTIONS" \
+            -k 1M \
             -c \
+            --file-allocation=falloc \
+            --disk-cache=64M \
+            --max-tries=10 \
+            --retry-wait=3 \
+            --connect-timeout=30 \
+            --timeout=60 \
             --console-log-level=warn \
             --show-console-readout=true \
             --summary-interval=0 \
@@ -237,10 +251,16 @@ install_cuda_and_cudnn() {
         log "Reusing the existing cuDNN local repository in /var/$cudnn_repo_name."
     else
         aria2c \
-            -x 8 \
-            -s 8 \
-            -k 4M \
+            -x "$HTTP_CONNECTIONS" \
+            -s "$HTTP_CONNECTIONS" \
+            -k 1M \
             -c \
+            --file-allocation=falloc \
+            --disk-cache=64M \
+            --max-tries=10 \
+            --retry-wait=3 \
+            --connect-timeout=30 \
+            --timeout=60 \
             --console-log-level=warn \
             --show-console-readout=true \
             --summary-interval=0 \
@@ -326,6 +346,46 @@ install_ffmpeg() {
     [[ "$(ffmpeg -version | awk 'NR == 1 { print $3 }')" == 7.* ]] || die "FFmpeg 7 installation verification failed."
 }
 
+download_model_http() {
+    local model_url="https://huggingface.co/${MODEL}/resolve/${MODEL_REVISION}/${MODEL_WEIGHTS}?download=true"
+    local downloaded_size
+
+    ensure_download_tools
+    mkdir -p "$LOCAL_MODEL_DIR"
+
+    log "Downloading model metadata and tokenizer files with Hugging Face HTTP..."
+    uv run hf download "$MODEL" \
+        --revision "$MODEL_REVISION" \
+        --local-dir "$LOCAL_MODEL_DIR" \
+        --exclude "$MODEL_WEIGHTS" \
+        --max-workers "$HTTP_CONNECTIONS"
+
+    log "Downloading $MODEL_WEIGHTS with $HTTP_CONNECTIONS resumable HTTP ranges..."
+    aria2c \
+        -x "$HTTP_CONNECTIONS" \
+        -s "$HTTP_CONNECTIONS" \
+        -k 1M \
+        -c \
+        --file-allocation=falloc \
+        --disk-cache=64M \
+        --max-tries=10 \
+        --retry-wait=3 \
+        --connect-timeout=30 \
+        --timeout=60 \
+        --console-log-level=warn \
+        --show-console-readout=true \
+        --summary-interval=0 \
+        --auto-file-renaming=false \
+        --allow-overwrite=true \
+        --dir="$LOCAL_MODEL_DIR" \
+        --out="$MODEL_WEIGHTS" \
+        "$model_url"
+
+    downloaded_size="$(stat -c '%s' "$LOCAL_MODEL_DIR/$MODEL_WEIGHTS")"
+    [[ "$downloaded_size" == "$MODEL_WEIGHTS_SIZE" ]] || \
+        die "Downloaded $MODEL_WEIGHTS is $downloaded_size bytes; expected $MODEL_WEIGHTS_SIZE bytes."
+}
+
 step "Install or verify CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION"
 install_cuda_and_cudnn
 export PATH="/usr/local/cuda-$CUDA_VERSION/bin:$HOME/.local/bin:$PATH"
@@ -340,12 +400,16 @@ step "Synchronize locked Python dependencies in $ENGINE_DIR"
 cd "$ENGINE_DIR"
 uv sync --frozen
 
+step "Download $MODEL over optimized HTTP"
+download_model_http
+
 export VLLM_BASE_URL="http://127.0.0.1:$VLLM_PORT/v1"
 export VLLM_MODEL="$MODEL"
 export PYTHONUNBUFFERED=1
 
 step "Start vLLM with $MODEL on port $VLLM_PORT"
-setsid stdbuf -oL -eL uv run vllm serve "$MODEL" \
+setsid stdbuf -oL -eL uv run vllm serve "$LOCAL_MODEL_DIR" \
+    --served-model-name "$MODEL" \
     --port "$VLLM_PORT" \
     --trust-remote-code \
     --max-model-len 8192 \
