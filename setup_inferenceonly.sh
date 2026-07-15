@@ -12,9 +12,36 @@ ENGINE_DIR="$SCRIPT_DIR/vllm_engine"
 VLLM_PID=""
 APP_PID=""
 CLEANED_UP=0
+STEP_CURRENT=0
+STEP_TOTAL=7
 
 log() {
     printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
+}
+
+step() {
+    local width="${COLUMNS:-}"
+    local line
+    local label
+    local color=""
+    local reset=""
+
+    (( STEP_CURRENT += 1 ))
+    if ! [[ "$width" =~ ^[0-9]+$ ]] || (( width < 40 )); then
+        width="$(tput cols 2>/dev/null || printf '80')"
+    fi
+    printf -v line '%*s' "$width" ''
+    line=${line// /=}
+    label="STEP $STEP_CURRENT/$STEP_TOTAL | $*"
+
+    if [[ -t 1 && "${TERM:-dumb}" != "dumb" ]]; then
+        color=$'\033[1;36m'
+        reset=$'\033[0m'
+    fi
+
+    printf '\n%b%s%b\n' "$color" "$line" "$reset"
+    printf '%b%-*s%b\n' "$color" "$width" "$label" "$reset"
+    printf '%b%s%b\n' "$color" "$line" "$reset"
 }
 
 die() {
@@ -94,6 +121,8 @@ fi
 HF_TOKEN=$1
 export HF_TOKEN
 export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+# Ensure Hugging Face uses the installed hf-xet client for model downloads.
+unset HF_HUB_DISABLE_XET
 set --
 
 [[ -r /etc/os-release ]] || die "This installer requires an Ubuntu system with apt."
@@ -181,11 +210,14 @@ install_ffmpeg() {
     [[ "$(ffmpeg -version | awk 'NR == 1 { print $3 }')" == 7.* ]] || die "FFmpeg 7 installation verification failed."
 }
 
+step "Verify NVIDIA GPU access"
 verify_nvidia_gpu
+step "Install or verify uv"
 install_uv
+step "Install or verify FFmpeg $FFMPEG_VERSION"
 install_ffmpeg
 
-log "Synchronizing locked dependencies in $ENGINE_DIR..."
+step "Synchronize locked Python dependencies in $ENGINE_DIR"
 cd "$ENGINE_DIR"
 uv sync --frozen
 
@@ -193,7 +225,7 @@ export VLLM_BASE_URL="http://127.0.0.1:$VLLM_PORT/v1"
 export VLLM_MODEL="$MODEL"
 export PYTHONUNBUFFERED=1
 
-log "Starting vLLM on port $VLLM_PORT..."
+step "Start vLLM with $MODEL on port $VLLM_PORT"
 setsid stdbuf -oL -eL uv run vllm serve "$MODEL" \
     --port "$VLLM_PORT" \
     --trust-remote-code \
@@ -203,7 +235,7 @@ setsid stdbuf -oL -eL uv run vllm serve "$MODEL" \
     --uvicorn-log-level trace &
 VLLM_PID=$!
 
-log "Waiting for vLLM to become healthy..."
+step "Wait for vLLM to become healthy"
 while ! curl -fsS "http://127.0.0.1:$VLLM_PORT/health" >/dev/null 2>&1; do
     kill -0 "$VLLM_PID" 2>/dev/null || {
         wait "$VLLM_PID" || true
@@ -212,7 +244,7 @@ while ! curl -fsS "http://127.0.0.1:$VLLM_PORT/health" >/dev/null 2>&1; do
     sleep 5
 done
 
-log "vLLM is ready. Starting app.py on 0.0.0.0:$APP_PORT with trace logging..."
+step "Start app.py on 0.0.0.0:$APP_PORT with trace logging"
 setsid stdbuf -oL -eL uv run uvicorn app:app \
     --host 0.0.0.0 \
     --port "$APP_PORT" \
