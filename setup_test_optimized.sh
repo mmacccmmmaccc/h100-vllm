@@ -2,6 +2,8 @@
 
 set -Eeuo pipefail
 
+SETUP_START_SECONDS=$SECONDS
+
 CUDA_VERSION="12.9"
 CUDA_RELEASE="12.9.1"
 CUDA_LOCAL_REPO_VERSION="12.9.1-575.57.08-1"
@@ -32,6 +34,19 @@ STEP_TOTAL=7
 
 log() {
     printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
+}
+
+format_duration() {
+    local total_seconds=$1
+    local hours=$((total_seconds / 3600))
+    local minutes=$(((total_seconds % 3600) / 60))
+    local seconds=$((total_seconds % 60))
+
+    if (( hours > 0 )); then
+        printf '%dh %02dm %02ds' "$hours" "$minutes" "$seconds"
+    else
+        printf '%dm %02ds' "$minutes" "$seconds"
+    fi
 }
 
 step() {
@@ -597,7 +612,16 @@ setsid stdbuf -oL -eL uv run uvicorn app:app \
     --log-level trace &
 APP_PID=$!
 
-log "API is listening on port $APP_PORT. Press Ctrl+C to stop app.py and vLLM."
+while ! curl -fsS "http://127.0.0.1:$APP_PORT/openapi.json" >/dev/null 2>&1; do
+    kill -0 "$APP_PID" 2>/dev/null || {
+        wait "$APP_PID" || true
+        die "app.py exited before port $APP_PORT became ready."
+    }
+    sleep 1
+done
+
+SETUP_ELAPSED_SECONDS=$((SECONDS - SETUP_START_SECONDS))
+log "API is listening on port $APP_PORT. Setup completed in $(format_duration "$SETUP_ELAPSED_SECONDS"). Press Ctrl+C to stop app.py and vLLM."
 
 set +e
 wait -n "$VLLM_PID" "$APP_PID"
