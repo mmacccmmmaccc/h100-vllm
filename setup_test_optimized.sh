@@ -667,10 +667,12 @@ show_download_dashboard() {
         dashboard_width="$(tput cols 2>/dev/null || printf '100')"
         (( dashboard_width < 72 )) && dashboard_width=72
         label_width=$((dashboard_width / 3))
-        (( label_width > 42 )) && label_width=42
-        bar_width=$((dashboard_width - label_width - 24))
+        (( label_width > 38 )) && label_width=38
+        # Leave enough room for brackets, percentage, the longest ETA text,
+        # and a safety margin so a wrapped row cannot break cursor redraws.
+        bar_width=$((dashboard_width - label_width - 32))
         (( bar_width < 12 )) && bar_width=12
-        (( bar_width > 48 )) && bar_width=48
+        (( bar_width > 40 )) && bar_width=40
     fi
     while process_group_is_alive "$UV_SYNC_PID" \
         || process_group_is_alive "$MODEL_DOWNLOAD_PID" \
@@ -688,14 +690,16 @@ show_download_dashboard() {
         overall_eta_value="$(overall_eta "$uv_eta" "$model_eta" "$cuda_eta")"
 
         if (( interactive == 1 )); then
-            (( rendered == 1 )) && printf '\033[4A'
-            printf '\033[2K\033[1;96m%s\033[0m\n' \
+            # Keep the cursor on the fourth row. Each refresh moves up exactly
+            # three rows and replaces the existing four-row dashboard.
+            (( rendered == 1 )) && printf '\r\033[3A'
+            printf '\r\033[2K\033[1;96m%s\033[0m\n' \
                 "$(progress_row 'OVERALL' "$overall_number" "$overall_eta_value" "$label_width" "$bar_width")"
-            printf '\033[2K%s\n' \
+            printf '\r\033[2K%s\n' \
                 "$(progress_row 'vLLM' "$uv_number" "$uv_eta" "$label_width" "$bar_width")"
-            printf '\033[2K%s\n' \
+            printf '\r\033[2K%s\n' \
                 "$(progress_row "$MODEL" "$model_number" "$model_eta" "$label_width" "$bar_width")"
-            printf '\033[2K%s\n' \
+            printf '\r\033[2K%s' \
                 "$(progress_row 'CUDA Toolkit' "$cuda_number" "$cuda_eta" "$label_width" "$bar_width")"
             rendered=1
         elif (( SECONDS - last_plain_update >= 10 || last_plain_update == 0 )); then
@@ -710,12 +714,12 @@ show_download_dashboard() {
     done
 
     if (( interactive == 1 )); then
-        (( rendered == 1 )) && printf '\033[4A'
-        printf '\033[2K\033[1;92m%s\033[0m\n' \
+        (( rendered == 1 )) && printf '\r\033[3A'
+        printf '\r\033[2K\033[1;92m%s\033[0m\n' \
             "$(progress_row 'OVERALL' 100 done "$label_width" "$bar_width")"
-        printf '\033[2K%s\n' "$(progress_row 'vLLM' 100 done "$label_width" "$bar_width")"
-        printf '\033[2K%s\n' "$(progress_row "$MODEL" 100 done "$label_width" "$bar_width")"
-        printf '\033[2K%s\n' "$(progress_row 'CUDA Toolkit' 100 done "$label_width" "$bar_width")"
+        printf '\r\033[2K%s\n' "$(progress_row 'vLLM' 100 done "$label_width" "$bar_width")"
+        printf '\r\033[2K%s\n' "$(progress_row "$MODEL" 100 done "$label_width" "$bar_width")"
+        printf '\r\033[2K%s\n' "$(progress_row 'CUDA Toolkit' 100 done "$label_width" "$bar_width")"
     else
         printf '%s\n%s\n%s\n%s\n' \
             "$(progress_row 'OVERALL' 100 done "$label_width" "$bar_width")" \
