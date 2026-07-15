@@ -95,6 +95,7 @@ fi
 HF_TOKEN=$1
 export HF_TOKEN
 export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+export HF_HUB_DISABLE_XET=1
 set --
 
 [[ -r /etc/os-release ]] || die "This installer requires an Ubuntu system with apt."
