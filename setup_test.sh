@@ -190,7 +190,8 @@ install_cuda_and_cudnn() {
             -k 4M \
             -c \
             --console-log-level=warn \
-            --summary-interval=1 \
+            --show-console-readout=true \
+            --summary-interval=0 \
             --auto-file-renaming=false \
             --allow-overwrite=true \
             --dir="$installer_cache_dir" \
@@ -214,7 +215,8 @@ install_cuda_and_cudnn() {
             -k 4M \
             -c \
             --console-log-level=warn \
-            --summary-interval=1 \
+            --show-console-readout=true \
+            --summary-interval=0 \
             --auto-file-renaming=false \
             --allow-overwrite=true \
             --dir="$installer_cache_dir" \
