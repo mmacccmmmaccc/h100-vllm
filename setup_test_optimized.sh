@@ -18,10 +18,15 @@ HTTP_CONNECTIONS="8"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE_DIR="$SCRIPT_DIR/vllm_engine"
 LOCAL_MODEL_DIR="$ENGINE_DIR/models/${MODEL//\//--}"
+MODEL_DOWNLOAD_LOG="$ENGINE_DIR/.model-download.log"
+UV_SYNC_LOG="$ENGINE_DIR/.uv-sync.log"
 VLLM_PID=""
 APP_PID=""
+MODEL_DOWNLOAD_PID=""
+UV_SYNC_PID=""
 INSTALL_TEMP_DIR=""
 CLEANED_UP=0
+APT_UPDATED=0
 STEP_CURRENT=0
 STEP_TOTAL=7
 
@@ -96,24 +101,30 @@ cleanup() {
         INSTALL_TEMP_DIR=""
     fi
 
-    if [[ -n "$APP_PID" || -n "$VLLM_PID" ]]; then
-        log "Stopping app and vLLM processes..."
+    if [[ -n "$APP_PID" || -n "$VLLM_PID" || -n "$MODEL_DOWNLOAD_PID" || -n "$UV_SYNC_PID" ]]; then
+        log "Stopping setup child processes..."
     fi
 
     stop_process_group "$APP_PID"
     stop_process_group "$VLLM_PID"
+    stop_process_group "$MODEL_DOWNLOAD_PID"
+    stop_process_group "$UV_SYNC_PID"
 
     local deadline=$((SECONDS + 15))
     while (( SECONDS < deadline )); do
         local app_alive=0
         local vllm_alive=0
+        local model_download_alive=0
+        local uv_sync_alive=0
         process_group_is_alive "$APP_PID" && app_alive=1
         process_group_is_alive "$VLLM_PID" && vllm_alive=1
-        (( app_alive == 0 && vllm_alive == 0 )) && break
+        process_group_is_alive "$MODEL_DOWNLOAD_PID" && model_download_alive=1
+        process_group_is_alive "$UV_SYNC_PID" && uv_sync_alive=1
+        (( app_alive == 0 && vllm_alive == 0 && model_download_alive == 0 && uv_sync_alive == 0 )) && break
         sleep 1
     done
 
-    for pid in "$APP_PID" "$VLLM_PID"; do
+    for pid in "$APP_PID" "$VLLM_PID" "$MODEL_DOWNLOAD_PID" "$UV_SYNC_PID"; do
         [[ -n "$pid" ]] || continue
         if process_group_is_alive "$pid"; then
             kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
@@ -203,12 +214,19 @@ esac
 
 [[ "$(uname -m)" == "x86_64" ]] || die "This CUDA installer currently supports x86_64 only."
 
+apt_update() {
+    if (( APT_UPDATED == 0 )); then
+        as_root apt-get update
+        APT_UPDATED=1
+    fi
+}
+
 ensure_download_tools() {
     if ! command -v curl >/dev/null 2>&1 \
         || ! command -v wget >/dev/null 2>&1 \
         || ! command -v aria2c >/dev/null 2>&1; then
         log "Installing download prerequisites..."
-        as_root apt-get update
+        apt_update
         apt_install aria2 ca-certificates curl wget
     fi
 }
@@ -313,7 +331,8 @@ install_cuda_and_cudnn() {
     [[ -n "$keyring" ]] || die "cuDNN local repository keyring was not found in /var/$cudnn_repo_name."
     as_root cp "$keyring" /usr/share/keyrings/
 
-    as_root apt-get update
+    APT_UPDATED=0
+    apt_update
     apt_install "cuda-toolkit-12-9" "cudnn9-cuda-12"
 
     as_root env DEBIAN_FRONTEND=noninteractive apt-get remove -y --purge \
@@ -342,14 +361,41 @@ install_uv() {
     command -v uv >/dev/null 2>&1 || die "uv installation did not produce an executable on PATH."
 }
 
-install_ngrok() {
+start_uv_sync() {
+    log "Starting locked Python dependency synchronization in the background..."
+    rm -f "$UV_SYNC_LOG"
+    setsid stdbuf -oL -eL uv sync --frozen >"$UV_SYNC_LOG" 2>&1 &
+    UV_SYNC_PID=$!
+}
+
+finish_uv_sync() {
+    [[ -n "$UV_SYNC_PID" ]] || return
+
+    log "Waiting for the background Python dependency synchronization..."
+    if wait "$UV_SYNC_PID"; then
+        UV_SYNC_PID=""
+        rm -f "$UV_SYNC_LOG"
+        log "Python dependencies are synchronized."
+    else
+        local status=$?
+        UV_SYNC_PID=""
+        tail -n 80 "$UV_SYNC_LOG" >&2 || true
+        die "uv sync failed with status $status; full output is in $UV_SYNC_LOG."
+    fi
+}
+
+configure_ngrok_repository() {
     if command -v ngrok >/dev/null 2>&1; then
-        log "ngrok is already installed: $(ngrok version)"
+        return
+    fi
+
+    if [[ -f /etc/apt/trusted.gpg.d/ngrok.asc && -f /etc/apt/sources.list.d/ngrok.list ]]; then
+        APT_UPDATED=0
         return
     fi
 
     ensure_download_tools
-    log "Installing ngrok from its official apt repository..."
+    log "Configuring ngrok's official apt repository..."
 
     local install_dir
     install_dir="$(mktemp -d)"
@@ -364,11 +410,22 @@ install_ngrok() {
         /etc/apt/trusted.gpg.d/ngrok.asc
     as_root install -m 644 "$install_dir/ngrok.list" \
         /etc/apt/sources.list.d/ngrok.list
-    as_root apt-get update
-    apt_install ngrok
+    APT_UPDATED=0
 
     rm -rf "$install_dir"
     INSTALL_TEMP_DIR=""
+}
+
+install_ngrok() {
+    if command -v ngrok >/dev/null 2>&1; then
+        log "ngrok is already installed: $(ngrok version)"
+        return
+    fi
+
+    configure_ngrok_repository
+    log "Installing ngrok..."
+    apt_update
+    apt_install ngrok
     command -v ngrok >/dev/null 2>&1 || die "ngrok installation did not produce an executable on PATH."
 }
 
@@ -385,7 +442,7 @@ install_ffmpeg() {
 
     ensure_download_tools
     log "Building and installing FFmpeg $FFMPEG_VERSION from the official source release..."
-    as_root apt-get update
+    apt_update
     apt_install build-essential nasm pkg-config xz-utils ca-certificates
 
     local build_dir
@@ -412,22 +469,21 @@ install_ffmpeg() {
     [[ "$(ffmpeg -version | awk 'NR == 1 { print $3 }')" == 7.* ]] || die "FFmpeg 7 installation verification failed."
 }
 
-download_model_http() {
+start_model_download() {
     local model_url="https://huggingface.co/${MODEL}/resolve/${MODEL_REVISION}/${MODEL_WEIGHTS}?download=true"
-    local downloaded_size
 
     ensure_download_tools
     mkdir -p "$LOCAL_MODEL_DIR"
 
-    log "Downloading model metadata and tokenizer files with Hugging Face HTTP..."
-    uv run hf download "$MODEL" \
-        --revision "$MODEL_REVISION" \
-        --local-dir "$LOCAL_MODEL_DIR" \
-        --exclude "$MODEL_WEIGHTS" \
-        --max-workers "$HTTP_CONNECTIONS"
+    if [[ -f "$LOCAL_MODEL_DIR/$MODEL_WEIGHTS" ]] \
+        && [[ "$(stat -c '%s' "$LOCAL_MODEL_DIR/$MODEL_WEIGHTS")" == "$MODEL_WEIGHTS_SIZE" ]]; then
+        log "$MODEL_WEIGHTS is already fully downloaded."
+        return
+    fi
 
-    log "Downloading $MODEL_WEIGHTS with $HTTP_CONNECTIONS resumable HTTP ranges..."
-    aria2c \
+    log "Starting $MODEL_WEIGHTS download in the background with $HTTP_CONNECTIONS resumable HTTP ranges..."
+    rm -f "$MODEL_DOWNLOAD_LOG"
+    setsid aria2c \
         -x "$HTTP_CONNECTIONS" \
         -s "$HTTP_CONNECTIONS" \
         -k 1M \
@@ -439,26 +495,61 @@ download_model_http() {
         --connect-timeout=30 \
         --timeout=60 \
         --console-log-level=warn \
-        --show-console-readout=true \
-        --summary-interval=0 \
+        --show-console-readout=false \
+        --summary-interval=30 \
         --auto-file-renaming=false \
         --allow-overwrite=true \
         --dir="$LOCAL_MODEL_DIR" \
         --out="$MODEL_WEIGHTS" \
-        "$model_url"
+        "$model_url" >"$MODEL_DOWNLOAD_LOG" 2>&1 &
+    MODEL_DOWNLOAD_PID=$!
+}
+
+finish_model_download() {
+    local downloaded_size
+
+    log "Downloading model metadata and tokenizer files with Hugging Face HTTP..."
+    uv run hf download "$MODEL" \
+        --revision "$MODEL_REVISION" \
+        --local-dir "$LOCAL_MODEL_DIR" \
+        --exclude "$MODEL_WEIGHTS" \
+        --max-workers "$HTTP_CONNECTIONS"
+
+    if [[ -n "$MODEL_DOWNLOAD_PID" ]]; then
+        log "Waiting for the background $MODEL_WEIGHTS download..."
+        if wait "$MODEL_DOWNLOAD_PID"; then
+            MODEL_DOWNLOAD_PID=""
+            rm -f "$MODEL_DOWNLOAD_LOG"
+        else
+            local status=$?
+            MODEL_DOWNLOAD_PID=""
+            tail -n 80 "$MODEL_DOWNLOAD_LOG" >&2 || true
+            die "$MODEL_WEIGHTS download failed with status $status; full output is in $MODEL_DOWNLOAD_LOG."
+        fi
+    fi
 
     downloaded_size="$(stat -c '%s' "$LOCAL_MODEL_DIR/$MODEL_WEIGHTS")"
     [[ "$downloaded_size" == "$MODEL_WEIGHTS_SIZE" ]] || \
         die "Downloaded $MODEL_WEIGHTS is $downloaded_size bytes; expected $MODEL_WEIGHTS_SIZE bytes."
 }
 
-step "Install or verify CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION"
-install_cuda_and_cudnn
-export PATH="/usr/local/cuda-$CUDA_VERSION/bin:$HOME/.local/bin:$PATH"
-export LD_LIBRARY_PATH="/usr/local/cuda-$CUDA_VERSION/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
 step "Install or verify uv"
 install_uv
+export PATH="$HOME/.local/bin:$PATH"
+
+cd "$ENGINE_DIR"
+ensure_download_tools
+start_model_download
+start_uv_sync
+if [[ -n "${NGROK_AUTHTOKEN:-}" ]]; then
+    configure_ngrok_repository
+fi
+
+step "Install or verify CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION"
+install_cuda_and_cudnn
+export PATH="/usr/local/cuda-$CUDA_VERSION/bin:$PATH"
+export LD_LIBRARY_PATH="/usr/local/cuda-$CUDA_VERSION/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 if [[ -n "${NGROK_AUTHTOKEN:-}" ]]; then
     step "Install or verify ngrok"
     install_ngrok
@@ -468,12 +559,11 @@ fi
 step "Install or verify FFmpeg $FFMPEG_VERSION"
 install_ffmpeg
 
-step "Synchronize locked Python dependencies in $ENGINE_DIR"
-cd "$ENGINE_DIR"
-uv sync --frozen
+step "Finish locked Python dependency synchronization in $ENGINE_DIR"
+finish_uv_sync
 
-step "Download $MODEL over optimized HTTP"
-download_model_http
+step "Finish downloading $MODEL over optimized HTTP"
+finish_model_download
 
 export VLLM_BASE_URL="http://127.0.0.1:$VLLM_PORT/v1"
 export VLLM_MODEL="$MODEL"
