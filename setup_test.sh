@@ -306,7 +306,7 @@ setsid stdbuf -oL -eL uv run vllm serve "$MODEL" \
     --max-model-len 8192 \
     --limit-mm-per-prompt.audio 1 \
     --mm-processor-kwargs.audio_kwargs.max_length 480000 \
-    --gpu-memory-utilzation 0.9
+    --gpu-memory-utilization 0.9
     --uvicorn-log-level trace &
 VLLM_PID=$!
 
