@@ -1394,12 +1394,10 @@ finish_background_download_progress_for_signal() {
 finish_uv_sync() {
     [[ -n "$UV_SYNC_PID" ]] || return 0
 
-    log "Waiting for the background Python dependency synchronization..."
     if wait "$UV_SYNC_PID"; then
         UV_SYNC_PID=""
         write_progress_state "$UV_PROGRESS_STATE_FILE" complete
         rm -f "$UV_SYNC_LOG"
-        log "Python dependencies are synchronized."
     else
         local status=$?
         UV_SYNC_PID=""
@@ -1520,7 +1518,6 @@ start_model_download() {
 finish_model_weights_download() {
     [[ -n "$MODEL_DOWNLOAD_PID" ]] || return 0
 
-    log "Waiting for the background $MODEL_WEIGHTS download..."
     if wait "$MODEL_DOWNLOAD_PID"; then
         MODEL_DOWNLOAD_PID=""
         write_progress_state "$MODEL_PROGRESS_STATE_FILE" complete
@@ -1541,7 +1538,6 @@ finish_model_download() {
         finish_model_weights_download
     fi
 
-    log "Downloading model metadata and tokenizer files with Hugging Face HTTP..."
     rm -f "$MODEL_METADATA_LOG"
     write_progress_state "$MODEL_METADATA_PROGRESS_STATE_FILE" running
     if uv run hf download "$MODEL" \
