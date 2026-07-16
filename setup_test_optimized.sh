@@ -44,7 +44,7 @@ APT_UPDATED=0
 CUDA_DOWNLOADS_STARTED=0
 SUDO_KEEPALIVE_PID=""
 STEP_CURRENT=0
-STEP_TOTAL=6
+STEP_TOTAL=5
 
 log() {
     printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
@@ -270,7 +270,6 @@ export HF_TOKEN
 export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 if [[ -n "$NGROK_AUTHTOKEN" ]]; then
     export NGROK_AUTHTOKEN
-    STEP_TOTAL=7
 else
     unset NGROK_AUTHTOKEN
 fi
@@ -917,6 +916,23 @@ format_transfer_metrics() {
     '
 }
 
+format_downloaded_megabytes() {
+    local current_bytes=$1
+    local rate_bytes=$2
+
+    LC_ALL=C awk -v current_bytes="$current_bytes" -v rate_bytes="$rate_bytes" '
+        function display_mb(value) {
+            if (value < 10) return sprintf("%.2f", value)
+            return sprintf("%.1f", value)
+        }
+        BEGIN {
+            printf "%s MB | %s MB/s", \
+                display_mb(current_bytes / 1000000), \
+                display_mb(rate_bytes / 1000000)
+        }
+    '
+}
+
 normalize_download_progress() {
     local progress_line=$1
     local current_value=""
@@ -1163,7 +1179,7 @@ uv_download_progress() {
         "$current_bytes" "$now"
 
     if (( fixed_total == 0 )); then
-        printf 'calculating total'
+        format_downloaded_megabytes "$current_bytes" "$rate_bytes"
         return
     fi
     (( current_bytes > fixed_total )) && current_bytes=$fixed_total
@@ -1485,6 +1501,7 @@ step "Install or verify uv"
 install_uv
 export PATH="$HOME/.local/bin:$PATH"
 
+step "Download prerequisites"
 cd "$ENGINE_DIR"
 ensure_download_tools
 initialize_download_progress_state
@@ -1492,28 +1509,23 @@ start_model_download
 start_uv_sync
 start_cuda_downloads
 start_background_download_progress
-
-
-step "Finish all background downloads before privileged installation"
 finish_uv_sync
 finish_model_download
 finish_cuda_downloads
+
+
+step "Install prerequisites"
 log "All background downloads are complete. Starting installation with cached sudo authorization."
-
-
-step "Install or verify CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION"
 install_cuda_and_cudnn
 export PATH="/usr/local/cuda-$CUDA_VERSION/bin:$PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda-$CUDA_VERSION/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 if [[ -n "${NGROK_AUTHTOKEN:-}" ]]; then
-    step "Install or verify ngrok"
     install_ngrok
 else
     log "ngrok is disabled because --ngrok-token was not provided."
 fi
 
-step "Install or verify FFmpeg $FFMPEG_VERSION"
 install_ffmpeg
 stop_sudo_keepalive
 
