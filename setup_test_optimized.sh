@@ -47,8 +47,9 @@ INSTALL_TEMP_DIR=""
 CLEANED_UP=0
 APT_UPDATED=0
 CUDA_DOWNLOADS_STARTED=0
+INTERACTIVE_SUDO_ALLOWED=0
 STEP_CURRENT=0
-STEP_TOTAL=7
+STEP_TOTAL=6
 CURRENT_STEP_LABEL=""
 
 log() {
@@ -188,7 +189,13 @@ as_root() {
         "$@"
     else
         command -v sudo >/dev/null 2>&1 || die "sudo is required to install system packages."
-        sudo "$@"
+        if (( INTERACTIVE_SUDO_ALLOWED == 0 )); then
+            sudo -n true 2>/dev/null || die \
+                "A privileged download prerequisite is missing. To keep loading password-free, install aria2, ca-certificates, curl, and wget before running this script."
+            sudo -n "$@"
+        else
+            sudo "$@"
+        fi
     fi
 }
 
@@ -335,7 +342,7 @@ export HF_TOKEN
 export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 if [[ -n "$NGROK_AUTHTOKEN" ]]; then
     export NGROK_AUTHTOKEN
-    STEP_TOTAL=8
+    STEP_TOTAL=7
 else
     unset NGROK_AUTHTOKEN
 fi
@@ -1551,9 +1558,14 @@ start_model_download
 start_uv_sync
 start_cuda_downloads
 start_background_download_progress
-if [[ -n "${NGROK_AUTHTOKEN:-}" ]]; then
-    configure_ngrok_repository
-fi
+
+
+step "Finish all background downloads before privileged installation"
+finish_uv_sync
+finish_model_download
+finish_cuda_downloads
+INTERACTIVE_SUDO_ALLOWED=1
+log "All background downloads are complete. Privileged installation may now request sudo access."
 
 
 step "Install or verify CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION"
@@ -1570,14 +1582,6 @@ fi
 
 step "Install or verify FFmpeg $FFMPEG_VERSION"
 install_ffmpeg
-
-
-step "Finish locked Python dependency synchronization in $ENGINE_DIR"
-finish_uv_sync
-
-
-step "Finish downloading $MODEL over optimized HTTP"
-finish_model_download
 
 export VLLM_BASE_URL="http://127.0.0.1:$VLLM_PORT/v1"
 export VLLM_MODEL="$MODEL"
