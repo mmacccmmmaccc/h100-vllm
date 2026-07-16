@@ -300,7 +300,7 @@ install_cuda_and_cudnn() {
             --connect-timeout=30 \
             --timeout=60 \
             --console-log-level=warn \
-            --show-console-readout=true \
+            --show-console-readout=false \
             --summary-interval=0 \
             --auto-file-renaming=false \
             --allow-overwrite=true \
@@ -331,7 +331,7 @@ install_cuda_and_cudnn() {
             --connect-timeout=30 \
             --timeout=60 \
             --console-log-level=warn \
-            --show-console-readout=true \
+            --show-console-readout=false \
             --summary-interval=0 \
             --auto-file-renaming=false \
             --allow-overwrite=true \
@@ -379,7 +379,9 @@ install_uv() {
 start_uv_sync() {
     log "Starting locked Python dependency synchronization in the background..."
     rm -f "$UV_SYNC_LOG"
-    setsid stdbuf -oL -eL uv sync --frozen >"$UV_SYNC_LOG" 2>&1 &
+    setsid bash -o pipefail -c '
+        stdbuf -oL -eL uv sync --frozen 2>&1 | tee "$1"
+    ' bash "$UV_SYNC_LOG" &
     UV_SYNC_PID=$!
 }
 
