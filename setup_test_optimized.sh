@@ -46,13 +46,22 @@ CUDA_DOWNLOADS_STARTED=0
 SUDO_KEEPALIVE_PID=""
 STEP_CURRENT=0
 STEP_TOTAL=5
-COUNT_STEP2_SETUP_LOGS=0
-STEP2_SETUP_LOG_COUNT=0
+COUNT_STEP2_SETUP_ROWS=0
+STEP2_SETUP_OUTPUT_ROWS=0
 
 log() {
-    printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
-    if (( COUNT_STEP2_SETUP_LOGS == 1 )); then
-        STEP2_SETUP_LOG_COUNT=$((STEP2_SETUP_LOG_COUNT + 1))
+    local output
+    local terminal_rows
+    local columns
+    local rendered_rows
+
+    printf -v output '[%s] [setup] %s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
+    printf '%s\n' "$output"
+    if (( COUNT_STEP2_SETUP_ROWS == 1 )); then
+        read -r terminal_rows columns < <(terminal_size)
+        rendered_rows=$(((${#output} + columns - 1) / columns))
+        (( rendered_rows >= 1 )) || rendered_rows=1
+        STEP2_SETUP_OUTPUT_ROWS=$((STEP2_SETUP_OUTPUT_ROWS + rendered_rows))
     fi
 }
 
@@ -106,7 +115,7 @@ download_step() {
 print_step2_setup_spacing() {
     local line
 
-    for (( line = 0; line < STEP2_SETUP_LOG_COUNT; line++ )); do
+    for (( line = 0; line < STEP2_SETUP_OUTPUT_ROWS; line++ )); do
         printf '\n'
     done
 }
@@ -1588,14 +1597,14 @@ export PATH="$HOME/.local/bin:$PATH"
 
 download_step "Download prerequisites"
 cd "$ENGINE_DIR"
-STEP2_SETUP_LOG_COUNT=0
-COUNT_STEP2_SETUP_LOGS=1
+STEP2_SETUP_OUTPUT_ROWS=0
+COUNT_STEP2_SETUP_ROWS=1
 ensure_download_tools
 initialize_download_progress_state
 start_model_download
 start_uv_sync
 start_cuda_downloads
-COUNT_STEP2_SETUP_LOGS=0
+COUNT_STEP2_SETUP_ROWS=0
 print_step2_setup_spacing
 start_background_download_progress
 finish_uv_sync
