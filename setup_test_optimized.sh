@@ -721,10 +721,14 @@ activate_background_progress_display() {
     BACKGROUND_PROGRESS_CONTENT_ROWS=$((rows - 5))
     BACKGROUND_PROGRESS_DISPLAY_ACTIVE=1
 
-    # Keep the step label and final four progress rows fixed. Process output
-    # continues scrolling normally in the region above this dashboard.
-    printf '\033[?25l\033[?6l\033[1;%dr\033[%d;1H' \
-        "$BACKGROUND_PROGRESS_CONTENT_ROWS" "$BACKGROUND_PROGRESS_CONTENT_ROWS"
+    # Scroll five blank lines into the full terminal before fixing the dashboard
+    # rows. This reserves clean space instead of painting over the latest setup
+    # or package-manager output already visible at the bottom of the terminal.
+    # Process output then continues scrolling normally above the dashboard.
+    printf '\033[?25l\033[?6l\033[%d;1H\n\n\n\n\n\033[1;%dr\033[%d;1H' \
+        "$BACKGROUND_PROGRESS_ROWS" \
+        "$BACKGROUND_PROGRESS_CONTENT_ROWS" \
+        "$BACKGROUND_PROGRESS_CONTENT_ROWS"
 }
 
 start_background_progress_display() {
