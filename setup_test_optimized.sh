@@ -86,14 +86,14 @@ download_step() {
     (( STEP_CURRENT += 1 ))
     DOWNLOAD_STEP_LABEL="STEP $STEP_CURRENT/$STEP_TOTAL | $*"
 
-    # A capable terminal gets this label as the fixed row immediately above
-    # the four download rows. Fall back to the normal banner elsewhere.
+    # A capable terminal gets the full banner fixed above the four download
+    # rows. Fall back to the normal scrolling banner elsewhere.
     if [[ ! -t 1 || "${TERM:-dumb}" == "dumb" ]]; then
         print_step_banner "$DOWNLOAD_STEP_LABEL"
         return
     fi
     read -r rows columns < <(terminal_size)
-    if (( rows < 9 || columns < 60 )); then
+    if (( rows < 12 || columns < 60 )); then
         print_step_banner "$DOWNLOAD_STEP_LABEL"
     fi
 }
@@ -243,6 +243,10 @@ handle_signal() {
     local signal=$1
     local status=$2
 
+    if [[ -n "${BACKGROUND_PROGRESS_PID:-}" ]] \
+        && declare -F finish_background_download_progress_for_signal >/dev/null 2>&1; then
+        finish_background_download_progress_for_signal
+    fi
     log "Received $signal; stopping setup and child processes..."
     exit "$status"
 }
@@ -716,16 +720,17 @@ activate_background_progress_display() {
 
     BACKGROUND_PROGRESS_ROWS=$rows
     BACKGROUND_PROGRESS_COLUMNS=$columns
-    BACKGROUND_PROGRESS_HEADER_ROW=$((rows - 4))
+    BACKGROUND_PROGRESS_SEPARATOR_ROW=$((rows - 7))
+    BACKGROUND_PROGRESS_BANNER_TOP_ROW=$((rows - 6))
+    BACKGROUND_PROGRESS_HEADER_ROW=$((rows - 5))
+    BACKGROUND_PROGRESS_BANNER_BOTTOM_ROW=$((rows - 4))
     BACKGROUND_PROGRESS_FIRST_ROW=$((rows - 3))
-    BACKGROUND_PROGRESS_CONTENT_ROWS=$((rows - 5))
+    BACKGROUND_PROGRESS_CONTENT_ROWS=$((rows - 8))
     BACKGROUND_PROGRESS_DISPLAY_ACTIVE=1
 
-    # Scroll five blank lines into the full terminal before fixing the dashboard
-    # rows. This reserves clean space instead of painting over the latest setup
-    # or package-manager output already visible at the bottom of the terminal.
-    # Process output then continues scrolling normally above the dashboard.
-    printf '\033[?25l\033[?6l\033[%d;1H\n\n\n\n\n\033[1;%dr\033[%d;1H' \
+    # Reserve eight clean rows: one separator, the three-line step banner, and
+    # the four progress rows. Process output continues scrolling above them.
+    printf '\033[?25l\033[?6l\033[%d;1H\n\n\n\n\n\n\n\n\033[1;%dr\033[%d;1H' \
         "$BACKGROUND_PROGRESS_ROWS" \
         "$BACKGROUND_PROGRESS_CONTENT_ROWS" \
         "$BACKGROUND_PROGRESS_CONTENT_ROWS"
@@ -741,7 +746,7 @@ start_background_progress_display() {
     fi
 
     read -r rows columns < <(terminal_size)
-    if (( rows < 9 || columns < 60 )); then
+    if (( rows < 12 || columns < 60 )); then
         return 1
     fi
     activate_background_progress_display "$rows" "$columns"
@@ -754,7 +759,7 @@ refresh_background_progress_display() {
     [[ -t 1 && "${TERM:-dumb}" != "dumb" ]] || return 0
     read -r rows columns < <(terminal_size)
 
-    if (( rows < 9 || columns < 60 )); then
+    if (( rows < 12 || columns < 60 )); then
         stop_background_progress_display
         return
     fi
@@ -847,6 +852,7 @@ render_background_progress() {
     local uv_text
     local cuda_text
     local cudnn_text
+    local banner_line
     local max_length=$((BACKGROUND_PROGRESS_COLUMNS - 1))
 
     (( BACKGROUND_PROGRESS_DISPLAY_ACTIVE == 1 )) || return 0
@@ -873,10 +879,17 @@ render_background_progress() {
     uv_text="$(style_progress_marker "$uv_text")"
     cuda_text="$(style_progress_marker "$cuda_text")"
     cudnn_text="$(style_progress_marker "$cudnn_text")"
+    printf -v banner_line '%*s' "$max_length" ''
+    banner_line=${banner_line// /=}
+    printf -v header_text '%-*s' "$max_length" "$header_text"
+    banner_line=$'\033[1;36m'"$banner_line"$'\033[0m'
     header_text=$'\033[1;36m'"$header_text"$'\033[0m'
 
-    printf '\0337\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\0338' \
+    printf '\0337\033[%d;1H\033[2K\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\0338' \
+        "$BACKGROUND_PROGRESS_SEPARATOR_ROW" \
+        "$BACKGROUND_PROGRESS_BANNER_TOP_ROW" "$banner_line" \
         "$BACKGROUND_PROGRESS_HEADER_ROW" "$header_text" \
+        "$BACKGROUND_PROGRESS_BANNER_BOTTOM_ROW" "$banner_line" \
         "$BACKGROUND_PROGRESS_FIRST_ROW" "$model_text" \
         "$((BACKGROUND_PROGRESS_FIRST_ROW + 1))" "$uv_text" \
         "$((BACKGROUND_PROGRESS_FIRST_ROW + 2))" "$cuda_text" \
@@ -884,15 +897,26 @@ render_background_progress() {
 }
 
 stop_background_progress_display() {
+    local preserve_output=${1:-0}
+
     (( ${BACKGROUND_PROGRESS_DISPLAY_ACTIVE:-0} == 1 )) || return 0
 
-    printf '\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[r\033[?6l\033[%d;1H\033[?25h' \
-        "$BACKGROUND_PROGRESS_HEADER_ROW" \
-        "$BACKGROUND_PROGRESS_FIRST_ROW" \
-        "$((BACKGROUND_PROGRESS_FIRST_ROW + 1))" \
-        "$((BACKGROUND_PROGRESS_FIRST_ROW + 2))" \
-        "$BACKGROUND_PROGRESS_ROWS" \
-        "$BACKGROUND_PROGRESS_ROWS"
+    if (( preserve_output == 1 )); then
+        # Restore normal scrolling, retain the last rendered dashboard, and
+        # advance to a clean line below it before signal cleanup logs begin.
+        printf '\033[r\033[?6l\033[%d;1H\n\033[?25h' "$BACKGROUND_PROGRESS_ROWS"
+    else
+        printf '\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[r\033[?6l\033[%d;1H\033[?25h' \
+            "$BACKGROUND_PROGRESS_SEPARATOR_ROW" \
+            "$BACKGROUND_PROGRESS_BANNER_TOP_ROW" \
+            "$BACKGROUND_PROGRESS_HEADER_ROW" \
+            "$BACKGROUND_PROGRESS_BANNER_BOTTOM_ROW" \
+            "$BACKGROUND_PROGRESS_FIRST_ROW" \
+            "$((BACKGROUND_PROGRESS_FIRST_ROW + 1))" \
+            "$((BACKGROUND_PROGRESS_FIRST_ROW + 2))" \
+            "$BACKGROUND_PROGRESS_ROWS" \
+            "$BACKGROUND_PROGRESS_ROWS"
+    fi
     BACKGROUND_PROGRESS_DISPLAY_ACTIVE=0
 }
 
@@ -1258,17 +1282,22 @@ show_background_download_progress() {
     local uv_progress
     local cuda_progress
     local cudnn_progress
+    local stop_mode=""
 
     BACKGROUND_PROGRESS_DISPLAY_ACTIVE=0
+    BACKGROUND_PROGRESS_PRESERVE_ON_STOP=0
     BACKGROUND_PROGRESS_ROWS=0
     BACKGROUND_PROGRESS_COLUMNS=0
+    BACKGROUND_PROGRESS_SEPARATOR_ROW=0
+    BACKGROUND_PROGRESS_BANNER_TOP_ROW=0
     BACKGROUND_PROGRESS_HEADER_ROW=0
+    BACKGROUND_PROGRESS_BANNER_BOTTOM_ROW=0
     BACKGROUND_PROGRESS_FIRST_ROW=0
     BACKGROUND_PROGRESS_CONTENT_ROWS=0
 
     start_background_progress_display || true
-    trap stop_background_progress_display EXIT
-    trap 'exit 0' INT TERM HUP
+    trap 'stop_background_progress_display "${BACKGROUND_PROGRESS_PRESERVE_ON_STOP:-0}"' EXIT
+    trap 'BACKGROUND_PROGRESS_PRESERVE_ON_STOP=1; exit 0' INT TERM HUP
 
     while [[ ! -e "$BACKGROUND_PROGRESS_STOP_FILE" ]]; do
         model_alive=0
@@ -1324,6 +1353,11 @@ show_background_download_progress() {
             "$cudnn_progress"
         sleep "$BACKGROUND_PROGRESS_INTERVAL"
     done
+
+    if IFS= read -r stop_mode < "$BACKGROUND_PROGRESS_STOP_FILE" \
+        && [[ "$stop_mode" == preserve ]]; then
+        BACKGROUND_PROGRESS_PRESERVE_ON_STOP=1
+    fi
 }
 
 start_background_download_progress() {
@@ -1344,6 +1378,14 @@ start_background_download_progress() {
 finish_background_download_progress() {
     if [[ -n "$BACKGROUND_PROGRESS_PID" ]]; then
         : > "$BACKGROUND_PROGRESS_STOP_FILE"
+        wait "$BACKGROUND_PROGRESS_PID" 2>/dev/null || true
+        BACKGROUND_PROGRESS_PID=""
+    fi
+}
+
+finish_background_download_progress_for_signal() {
+    if [[ -n "$BACKGROUND_PROGRESS_PID" ]]; then
+        printf 'preserve\n' > "$BACKGROUND_PROGRESS_STOP_FILE"
         wait "$BACKGROUND_PROGRESS_PID" 2>/dev/null || true
         BACKGROUND_PROGRESS_PID=""
     fi
