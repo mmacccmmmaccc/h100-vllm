@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -Eeuo pipefail
+SETUP_START_SECONDS=$SECONDS
 
 # Fixed component versions and runtime settings.
 CUDA_VERSION="12.9"
@@ -1600,6 +1601,11 @@ while ! curl -fsS "http://127.0.0.1:$APP_PORT/openapi.json" >/dev/null 2>&1; do
     sleep 1
 done
 
+setup_elapsed_seconds=$((SECONDS - SETUP_START_SECONDS))
+printf -v setup_elapsed_time '%02d:%02d' \
+    "$((setup_elapsed_seconds / 60))" \
+    "$((setup_elapsed_seconds % 60))"
+log "Time from setup start until app.py became accessible: $setup_elapsed_time."
 log "API is listening on port $APP_PORT. Setup is complete. Press Ctrl+C to stop app.py and vLLM."
 
 set +e
