@@ -46,9 +46,14 @@ CUDA_DOWNLOADS_STARTED=0
 SUDO_KEEPALIVE_PID=""
 STEP_CURRENT=0
 STEP_TOTAL=5
+COUNT_STEP2_SETUP_LOGS=0
+STEP2_SETUP_LOG_COUNT=0
 
 log() {
     printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
+    if (( COUNT_STEP2_SETUP_LOGS == 1 )); then
+        STEP2_SETUP_LOG_COUNT=$((STEP2_SETUP_LOG_COUNT + 1))
+    fi
 }
 
 print_step_banner() {
@@ -96,6 +101,14 @@ download_step() {
     if (( rows < 12 || columns < 60 )); then
         print_step_banner "$DOWNLOAD_STEP_LABEL"
     fi
+}
+
+print_step2_setup_spacing() {
+    local line
+
+    for (( line = 0; line < STEP2_SETUP_LOG_COUNT; line++ )); do
+        printf '\n'
+    done
 }
 
 die() {
@@ -720,18 +733,16 @@ activate_background_progress_display() {
 
     BACKGROUND_PROGRESS_ROWS=$rows
     BACKGROUND_PROGRESS_COLUMNS=$columns
-    BACKGROUND_PROGRESS_SEPARATOR_ROW=$((rows - 7))
     BACKGROUND_PROGRESS_BANNER_TOP_ROW=$((rows - 6))
     BACKGROUND_PROGRESS_HEADER_ROW=$((rows - 5))
     BACKGROUND_PROGRESS_BANNER_BOTTOM_ROW=$((rows - 4))
     BACKGROUND_PROGRESS_FIRST_ROW=$((rows - 3))
-    BACKGROUND_PROGRESS_CONTENT_ROWS=$((rows - 8))
+    BACKGROUND_PROGRESS_CONTENT_ROWS=$((rows - 7))
     BACKGROUND_PROGRESS_DISPLAY_ACTIVE=1
 
-    # Reserve eight clean rows: one separator, the three-line step banner, and
-    # the four progress rows. Process output continues scrolling above them.
-    printf '\033[?25l\033[?6l\033[%d;1H\n\n\n\n\n\n\n\n\033[1;%dr\033[%d;1H' \
-        "$BACKGROUND_PROGRESS_ROWS" \
+    # Scroll seven clean rows into place without emitting more newline
+    # characters, then reserve them for the banner and four progress rows.
+    printf '\033[?25l\033[?6l\033[r\033[7S\033[1;%dr\033[%d;1H' \
         "$BACKGROUND_PROGRESS_CONTENT_ROWS" \
         "$BACKGROUND_PROGRESS_CONTENT_ROWS"
 }
@@ -885,8 +896,7 @@ render_background_progress() {
     banner_line=$'\033[1;36m'"$banner_line"$'\033[0m'
     header_text=$'\033[1;36m'"$header_text"$'\033[0m'
 
-    printf '\0337\033[%d;1H\033[2K\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\0338' \
-        "$BACKGROUND_PROGRESS_SEPARATOR_ROW" \
+    printf '\0337\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\0338' \
         "$BACKGROUND_PROGRESS_BANNER_TOP_ROW" "$banner_line" \
         "$BACKGROUND_PROGRESS_HEADER_ROW" "$header_text" \
         "$BACKGROUND_PROGRESS_BANNER_BOTTOM_ROW" "$banner_line" \
@@ -906,8 +916,7 @@ stop_background_progress_display() {
         # advance to a clean line below it before signal cleanup logs begin.
         printf '\033[r\033[?6l\033[%d;1H\n\033[?25h' "$BACKGROUND_PROGRESS_ROWS"
     else
-        printf '\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[r\033[?6l\033[%d;1H\033[?25h' \
-            "$BACKGROUND_PROGRESS_SEPARATOR_ROW" \
+        printf '\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[r\033[?6l\033[%d;1H\033[?25h' \
             "$BACKGROUND_PROGRESS_BANNER_TOP_ROW" \
             "$BACKGROUND_PROGRESS_HEADER_ROW" \
             "$BACKGROUND_PROGRESS_BANNER_BOTTOM_ROW" \
@@ -1288,7 +1297,6 @@ show_background_download_progress() {
     BACKGROUND_PROGRESS_PRESERVE_ON_STOP=0
     BACKGROUND_PROGRESS_ROWS=0
     BACKGROUND_PROGRESS_COLUMNS=0
-    BACKGROUND_PROGRESS_SEPARATOR_ROW=0
     BACKGROUND_PROGRESS_BANNER_TOP_ROW=0
     BACKGROUND_PROGRESS_HEADER_ROW=0
     BACKGROUND_PROGRESS_BANNER_BOTTOM_ROW=0
@@ -1580,11 +1588,15 @@ export PATH="$HOME/.local/bin:$PATH"
 
 download_step "Download prerequisites"
 cd "$ENGINE_DIR"
+STEP2_SETUP_LOG_COUNT=0
+COUNT_STEP2_SETUP_LOGS=1
 ensure_download_tools
 initialize_download_progress_state
 start_model_download
 start_uv_sync
 start_cuda_downloads
+COUNT_STEP2_SETUP_LOGS=0
+print_step2_setup_spacing
 start_background_download_progress
 finish_uv_sync
 finish_model_download
