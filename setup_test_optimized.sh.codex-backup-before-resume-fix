@@ -45,9 +45,23 @@ CUDA_DOWNLOADS_STARTED=0
 SUDO_KEEPALIVE_PID=""
 STEP_CURRENT=0
 STEP_TOTAL=5
+COUNT_STEP2_SETUP_ROWS=0
+STEP2_SETUP_OUTPUT_ROWS=0
 
 log() {
-    printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
+    local output
+    local terminal_rows
+    local columns
+    local rendered_rows
+
+    printf -v output '[%s] [setup] %s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
+    printf '%s\n' "$output"
+    if (( COUNT_STEP2_SETUP_ROWS == 1 )); then
+        read -r terminal_rows columns < <(terminal_size)
+        rendered_rows=$(((${#output} + columns - 1) / columns))
+        (( rendered_rows >= 1 )) || rendered_rows=1
+        STEP2_SETUP_OUTPUT_ROWS=$((STEP2_SETUP_OUTPUT_ROWS + rendered_rows))
+    fi
 }
 
 print_step_banner() {
@@ -81,6 +95,14 @@ step() {
 download_step() {
     (( STEP_CURRENT += 1 ))
     print_step_banner "STEP $STEP_CURRENT/$STEP_TOTAL | $*"
+}
+
+print_step2_setup_spacing() {
+    local line
+
+    for (( line = 0; line < STEP2_SETUP_OUTPUT_ROWS; line++ )); do
+        printf '\n'
+    done
 }
 
 die() {
@@ -1453,8 +1475,7 @@ start_model_download() {
     ensure_download_tools
     mkdir -p "$LOCAL_MODEL_DIR"
 
-    if [[ ! -e "$LOCAL_MODEL_DIR/${MODEL_WEIGHTS}.aria2" ]] \
-        && [[ -f "$LOCAL_MODEL_DIR/$MODEL_WEIGHTS" ]] \
+    if [[ -f "$LOCAL_MODEL_DIR/$MODEL_WEIGHTS" ]] \
         && [[ "$(stat -c '%s' "$LOCAL_MODEL_DIR/$MODEL_WEIGHTS")" == "$MODEL_WEIGHTS_SIZE" ]]; then
         log "$MODEL_WEIGHTS is already fully downloaded."
         write_progress_state "$MODEL_PROGRESS_STATE_FILE" cached
@@ -1476,10 +1497,6 @@ finish_model_weights_download() {
 
     if wait "$MODEL_DOWNLOAD_PID"; then
         MODEL_DOWNLOAD_PID=""
-        if [[ -e "$LOCAL_MODEL_DIR/${MODEL_WEIGHTS}.aria2" ]]; then
-            write_progress_state "$MODEL_PROGRESS_STATE_FILE" failed
-            die "$MODEL_WEIGHTS still has an aria2 control file and is incomplete."
-        fi
         write_progress_state "$MODEL_PROGRESS_STATE_FILE" complete
         rm -f "$MODEL_DOWNLOAD_LOG"
     else
@@ -1520,10 +1537,6 @@ finish_model_download() {
         write_progress_state "$MODEL_PROGRESS_STATE_FILE" failed
         die "Downloaded model weights were not found at $LOCAL_MODEL_DIR/$MODEL_WEIGHTS."
     fi
-    if [[ -e "$LOCAL_MODEL_DIR/${MODEL_WEIGHTS}.aria2" ]]; then
-        write_progress_state "$MODEL_PROGRESS_STATE_FILE" failed
-        die "Downloaded $MODEL_WEIGHTS is incomplete because its aria2 control file still exists."
-    fi
     downloaded_size="$(stat -c '%s' "$LOCAL_MODEL_DIR/$MODEL_WEIGHTS")"
     if [[ "$downloaded_size" != "$MODEL_WEIGHTS_SIZE" ]]; then
         write_progress_state "$MODEL_PROGRESS_STATE_FILE" failed
@@ -1544,12 +1557,15 @@ export PATH="$HOME/.local/bin:$PATH"
 
 download_step "Download prerequisites"
 cd "$ENGINE_DIR"
+STEP2_SETUP_OUTPUT_ROWS=0
+COUNT_STEP2_SETUP_ROWS=1
 ensure_download_tools
 initialize_download_progress_state
 start_model_download
 start_uv_sync
 start_cuda_downloads
-printf '\n'
+COUNT_STEP2_SETUP_ROWS=0
+print_step2_setup_spacing
 start_background_download_progress
 finish_uv_sync
 finish_model_download
