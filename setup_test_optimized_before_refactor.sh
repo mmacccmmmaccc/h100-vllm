@@ -45,23 +45,9 @@ CUDA_DOWNLOADS_STARTED=0
 SUDO_KEEPALIVE_PID=""
 STEP_CURRENT=0
 STEP_TOTAL=5
-COUNT_STEP2_SETUP_ROWS=0
-STEP2_SETUP_OUTPUT_ROWS=0
 
 log() {
-    local output
-    local terminal_rows
-    local columns
-    local rendered_rows
-
-    printf -v output '[%s] [setup] %s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
-    printf '%s\n' "$output"
-    if (( COUNT_STEP2_SETUP_ROWS == 1 )); then
-        read -r terminal_rows columns < <(terminal_size)
-        rendered_rows=$(((${#output} + columns - 1) / columns))
-        (( rendered_rows >= 1 )) || rendered_rows=1
-        STEP2_SETUP_OUTPUT_ROWS=$((STEP2_SETUP_OUTPUT_ROWS + rendered_rows))
-    fi
+    printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
 }
 
 print_step_banner() {
@@ -95,14 +81,6 @@ step() {
 download_step() {
     (( STEP_CURRENT += 1 ))
     print_step_banner "STEP $STEP_CURRENT/$STEP_TOTAL | $*"
-}
-
-print_step2_setup_spacing() {
-    local line
-
-    for (( line = 0; line < STEP2_SETUP_OUTPUT_ROWS; line++ )); do
-        printf '\n'
-    done
 }
 
 die() {
@@ -472,6 +450,7 @@ start_aria2_background_download() {
         --timeout=60 \
         --console-log-level=warn \
         --show-console-readout=true \
+        --human-readable=false \
         --summary-interval=1 \
         --auto-file-renaming=false \
         --allow-overwrite=true \
@@ -731,11 +710,10 @@ activate_background_progress_display() {
     BACKGROUND_PROGRESS_CONTENT_ROWS=$((rows - 4))
     BACKGROUND_PROGRESS_DISPLAY_ACTIVE=1
 
-    # Scroll four clean rows into place without emitting more newline
-    # characters, then reserve them for the live progress display.
-    printf '\033[?25l\033[?6l\033[r\033[4S\033[1;%dr\033[%d;1H' \
-        "$BACKGROUND_PROGRESS_CONTENT_ROWS" \
-        "$BACKGROUND_PROGRESS_CONTENT_ROWS"
+    # Preserve the current output position while clearing any margin left by
+    # an interrupted older run. The parent separator has placed the cursor on
+    # progress row one; add three rows and keep the cursor on progress row four.
+    printf '\0337\033[?6l\033[r\0338\033[?25l\033[?7l\r\n\r\n\r\n'
 }
 
 start_background_progress_display() {
@@ -768,8 +746,10 @@ refresh_background_progress_display() {
     if (( BACKGROUND_PROGRESS_DISPLAY_ACTIVE == 0 )); then
         activate_background_progress_display "$rows" "$columns"
     elif (( rows != BACKGROUND_PROGRESS_ROWS || columns != BACKGROUND_PROGRESS_COLUMNS )); then
-        stop_background_progress_display
-        activate_background_progress_display "$rows" "$columns"
+        BACKGROUND_PROGRESS_ROWS=$rows
+        BACKGROUND_PROGRESS_COLUMNS=$columns
+        BACKGROUND_PROGRESS_FIRST_ROW=$((rows - 3))
+        BACKGROUND_PROGRESS_CONTENT_ROWS=$((rows - 4))
     fi
 }
 
@@ -877,11 +857,13 @@ render_background_progress() {
     cuda_text="$(style_progress_marker "$cuda_text")"
     cudnn_text="$(style_progress_marker "$cudnn_text")"
 
-    printf '\0337\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\0338' \
-        "$BACKGROUND_PROGRESS_FIRST_ROW" "$model_text" \
-        "$((BACKGROUND_PROGRESS_FIRST_ROW + 1))" "$uv_text" \
-        "$((BACKGROUND_PROGRESS_FIRST_ROW + 2))" "$cuda_text" \
-        "$BACKGROUND_PROGRESS_ROWS" "$cudnn_text"
+    # The hidden cursor stays on progress row four. Move to row one, redraw
+    # all four rows, and finish on row four without emitting another newline.
+    printf '\033[3F\033[2K%s\r\n\033[2K%s\r\n\033[2K%s\r\n\033[2K%s' \
+        "$model_text" \
+        "$uv_text" \
+        "$cuda_text" \
+        "$cudnn_text"
 }
 
 stop_background_progress_display() {
@@ -890,16 +872,12 @@ stop_background_progress_display() {
     (( ${BACKGROUND_PROGRESS_DISPLAY_ACTIVE:-0} == 1 )) || return 0
 
     if (( preserve_output == 1 )); then
-        # Restore normal scrolling, retain the last rendered dashboard, and
-        # advance to a clean line below it before signal cleanup logs begin.
-        printf '\033[r\033[?6l\033[%d;1H\n\033[?25h' "$BACKGROUND_PROGRESS_ROWS"
+        # Retain the dashboard and leave one blank line before cleanup logs.
+        printf '\r\n\r\n\033[?7h\033[?25h'
     else
-        printf '\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[r\033[?6l\033[%d;1H\033[?25h' \
-            "$BACKGROUND_PROGRESS_FIRST_ROW" \
-            "$((BACKGROUND_PROGRESS_FIRST_ROW + 1))" \
-            "$((BACKGROUND_PROGRESS_FIRST_ROW + 2))" \
-            "$BACKGROUND_PROGRESS_ROWS" \
-            "$BACKGROUND_PROGRESS_ROWS"
+        # Clear all four rows, then return to the first so the next step uses
+        # the space previously occupied by the transient dashboard.
+        printf '\033[3F\033[2K\033[1E\033[2K\033[1E\033[2K\033[1E\033[2K\033[3F\033[?7h\033[?25h'
     fi
     BACKGROUND_PROGRESS_DISPLAY_ACTIVE=0
 }
@@ -1475,7 +1453,8 @@ start_model_download() {
     ensure_download_tools
     mkdir -p "$LOCAL_MODEL_DIR"
 
-    if [[ -f "$LOCAL_MODEL_DIR/$MODEL_WEIGHTS" ]] \
+    if [[ ! -e "$LOCAL_MODEL_DIR/${MODEL_WEIGHTS}.aria2" ]] \
+        && [[ -f "$LOCAL_MODEL_DIR/$MODEL_WEIGHTS" ]] \
         && [[ "$(stat -c '%s' "$LOCAL_MODEL_DIR/$MODEL_WEIGHTS")" == "$MODEL_WEIGHTS_SIZE" ]]; then
         log "$MODEL_WEIGHTS is already fully downloaded."
         write_progress_state "$MODEL_PROGRESS_STATE_FILE" cached
@@ -1497,6 +1476,10 @@ finish_model_weights_download() {
 
     if wait "$MODEL_DOWNLOAD_PID"; then
         MODEL_DOWNLOAD_PID=""
+        if [[ -e "$LOCAL_MODEL_DIR/${MODEL_WEIGHTS}.aria2" ]]; then
+            write_progress_state "$MODEL_PROGRESS_STATE_FILE" failed
+            die "$MODEL_WEIGHTS still has an aria2 control file and is incomplete."
+        fi
         write_progress_state "$MODEL_PROGRESS_STATE_FILE" complete
         rm -f "$MODEL_DOWNLOAD_LOG"
     else
@@ -1537,6 +1520,10 @@ finish_model_download() {
         write_progress_state "$MODEL_PROGRESS_STATE_FILE" failed
         die "Downloaded model weights were not found at $LOCAL_MODEL_DIR/$MODEL_WEIGHTS."
     fi
+    if [[ -e "$LOCAL_MODEL_DIR/${MODEL_WEIGHTS}.aria2" ]]; then
+        write_progress_state "$MODEL_PROGRESS_STATE_FILE" failed
+        die "Downloaded $MODEL_WEIGHTS is incomplete because its aria2 control file still exists."
+    fi
     downloaded_size="$(stat -c '%s' "$LOCAL_MODEL_DIR/$MODEL_WEIGHTS")"
     if [[ "$downloaded_size" != "$MODEL_WEIGHTS_SIZE" ]]; then
         write_progress_state "$MODEL_PROGRESS_STATE_FILE" failed
@@ -1557,15 +1544,12 @@ export PATH="$HOME/.local/bin:$PATH"
 
 download_step "Download prerequisites"
 cd "$ENGINE_DIR"
-STEP2_SETUP_OUTPUT_ROWS=0
-COUNT_STEP2_SETUP_ROWS=1
 ensure_download_tools
 initialize_download_progress_state
 start_model_download
 start_uv_sync
 start_cuda_downloads
-COUNT_STEP2_SETUP_ROWS=0
-print_step2_setup_spacing
+printf '\n'
 start_background_download_progress
 finish_uv_sync
 finish_model_download

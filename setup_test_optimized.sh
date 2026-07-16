@@ -2,6 +2,7 @@
 
 set -Eeuo pipefail
 
+# Fixed component versions and runtime settings.
 CUDA_VERSION="12.9"
 CUDA_RELEASE="12.9.1"
 CUDA_LOCAL_REPO_VERSION="12.9.1-575.57.08-1"
@@ -16,6 +17,7 @@ APP_PORT="7000"
 HTTP_CONNECTIONS="8"
 BACKGROUND_PROGRESS_INTERVAL="1"
 
+# Derived paths and mutable process state.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE_DIR="$SCRIPT_DIR/vllm_engine"
 LOCAL_MODEL_DIR="$ENGINE_DIR/models/${MODEL//\//--}"
@@ -46,6 +48,7 @@ SUDO_KEEPALIVE_PID=""
 STEP_CURRENT=0
 STEP_TOTAL=5
 
+# Output helpers.
 log() {
     printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
 }
@@ -78,16 +81,12 @@ step() {
     print_step_banner "STEP $STEP_CURRENT/$STEP_TOTAL | $*"
 }
 
-download_step() {
-    (( STEP_CURRENT += 1 ))
-    print_step_banner "STEP $STEP_CURRENT/$STEP_TOTAL | $*"
-}
-
 die() {
     printf '[setup] ERROR: %s\n' "$*" >&2
     exit 1
 }
 
+# Privilege, subprocess, and cleanup helpers.
 as_root() {
     if (( EUID == 0 )); then
         "$@"
@@ -241,6 +240,7 @@ trap 'handle_signal INT 130' INT
 trap 'handle_signal TERM 143' TERM
 trap 'handle_signal HUP 129' HUP
 
+# CLI parsing and host validation.
 usage() {
     printf 'Usage: bash %s --hf-token TOKEN [--ngrok-token TOKEN]\n' "${0##*/}"
 }
@@ -313,6 +313,7 @@ CUDNN_REPO_NAME="cudnn-local-repo-${CUDA_REPO_DISTRO}-${CUDNN_VERSION}"
 CUDNN_REPO_DEB="${CUDNN_REPO_NAME}_1.0-1_amd64.deb"
 INSTALLER_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/h100-vllm/installers"
 
+# Download prerequisites and shared progress state.
 apt_update() {
     if (( APT_UPDATED == 0 )); then
         as_root apt-get update
@@ -399,6 +400,7 @@ nvidia_repo_is_ready() {
         && [[ -d "/var/$repo_name" ]]
 }
 
+# Background download process management.
 start_state_tracked_background_process() {
     local state_file=$1
     local log_file=$2
@@ -450,6 +452,7 @@ start_aria2_background_download() {
         --timeout=60 \
         --console-log-level=warn \
         --show-console-readout=true \
+        --human-readable=false \
         --summary-interval=1 \
         --auto-file-renaming=false \
         --allow-overwrite=true \
@@ -481,32 +484,32 @@ start_cuda_downloads() {
     ensure_download_tools
     mkdir -p "$INSTALLER_CACHE_DIR"
 
-    if (( cuda_installed == 1 )); then
-        :
-    elif ! nvidia_repo_is_ready "$CUDA_REPO_NAME"; then
-        start_aria2_background_download \
-            "$CUDA_REPO_DEB" \
-            "https://developer.download.nvidia.com/compute/cuda/${CUDA_RELEASE}/local_installers/${CUDA_REPO_DEB}" \
-            "$INSTALLER_CACHE_DIR" \
-            "$CUDA_DOWNLOAD_LOG" \
-            "$CUDA_PROGRESS_STATE_FILE" \
-            CUDA_DOWNLOAD_PID
-    else
-        write_progress_state "$CUDA_PROGRESS_STATE_FILE" cached
+    if (( cuda_installed == 0 )); then
+        if ! nvidia_repo_is_ready "$CUDA_REPO_NAME"; then
+            start_aria2_background_download \
+                "$CUDA_REPO_DEB" \
+                "https://developer.download.nvidia.com/compute/cuda/${CUDA_RELEASE}/local_installers/${CUDA_REPO_DEB}" \
+                "$INSTALLER_CACHE_DIR" \
+                "$CUDA_DOWNLOAD_LOG" \
+                "$CUDA_PROGRESS_STATE_FILE" \
+                CUDA_DOWNLOAD_PID
+        else
+            write_progress_state "$CUDA_PROGRESS_STATE_FILE" cached
+        fi
     fi
 
-    if (( cudnn_installed == 1 )); then
-        :
-    elif ! nvidia_repo_is_ready "$CUDNN_REPO_NAME"; then
-        start_aria2_background_download \
-            "$CUDNN_REPO_DEB" \
-            "https://developer.download.nvidia.com/compute/cudnn/${CUDNN_VERSION}/local_installers/${CUDNN_REPO_DEB}" \
-            "$INSTALLER_CACHE_DIR" \
-            "$CUDNN_DOWNLOAD_LOG" \
-            "$CUDNN_PROGRESS_STATE_FILE" \
-            CUDNN_DOWNLOAD_PID
-    else
-        write_progress_state "$CUDNN_PROGRESS_STATE_FILE" cached
+    if (( cudnn_installed == 0 )); then
+        if ! nvidia_repo_is_ready "$CUDNN_REPO_NAME"; then
+            start_aria2_background_download \
+                "$CUDNN_REPO_DEB" \
+                "https://developer.download.nvidia.com/compute/cudnn/${CUDNN_VERSION}/local_installers/${CUDNN_REPO_DEB}" \
+                "$INSTALLER_CACHE_DIR" \
+                "$CUDNN_DOWNLOAD_LOG" \
+                "$CUDNN_PROGRESS_STATE_FILE" \
+                CUDNN_DOWNLOAD_PID
+        else
+            write_progress_state "$CUDNN_PROGRESS_STATE_FILE" cached
+        fi
     fi
 }
 
@@ -670,6 +673,7 @@ install_uv() {
     command -v uv >/dev/null 2>&1 || die "uv installation did not produce an executable on PATH."
 }
 
+# Live download dashboard.
 start_uv_sync() {
     log "Starting locked Python dependency synchronization with uv..."
     # uv only emits its live download bars to a terminal. Give it a private PTY
@@ -705,15 +709,12 @@ activate_background_progress_display() {
 
     BACKGROUND_PROGRESS_ROWS=$rows
     BACKGROUND_PROGRESS_COLUMNS=$columns
-    BACKGROUND_PROGRESS_FIRST_ROW=$((rows - 3))
-    BACKGROUND_PROGRESS_CONTENT_ROWS=$((rows - 4))
     BACKGROUND_PROGRESS_DISPLAY_ACTIVE=1
 
-    # Scroll four clean rows into place without emitting more newline
-    # characters, then reserve them for the live progress display.
-    printf '\033[?25l\033[?6l\033[r\033[4S\033[1;%dr\033[%d;1H' \
-        "$BACKGROUND_PROGRESS_CONTENT_ROWS" \
-        "$BACKGROUND_PROGRESS_CONTENT_ROWS"
+    # Preserve the current output position while clearing any margin left by
+    # an interrupted older run. The parent separator has placed the cursor on
+    # progress row one; add three rows and keep the cursor on progress row four.
+    printf '\0337\033[?6l\033[r\0338\033[?25l\033[?7l\r\n\r\n\r\n'
 }
 
 start_background_progress_display() {
@@ -746,18 +747,9 @@ refresh_background_progress_display() {
     if (( BACKGROUND_PROGRESS_DISPLAY_ACTIVE == 0 )); then
         activate_background_progress_display "$rows" "$columns"
     elif (( rows != BACKGROUND_PROGRESS_ROWS || columns != BACKGROUND_PROGRESS_COLUMNS )); then
-        stop_background_progress_display
-        activate_background_progress_display "$rows" "$columns"
+        BACKGROUND_PROGRESS_ROWS=$rows
+        BACKGROUND_PROGRESS_COLUMNS=$columns
     fi
-}
-
-compact_dashboard_progress() {
-    local progress=$1
-
-    progress=${progress//" / "/"/"}
-    progress=${progress//" MB"/"MB"}
-    progress=${progress//" | "/" "}
-    printf '%s' "$progress"
 }
 
 fit_dashboard_progress_row() {
@@ -775,7 +767,9 @@ fit_dashboard_progress_row() {
         return
     fi
 
-    compact_progress="$(compact_dashboard_progress "$progress")"
+    compact_progress=${progress//" / "/"/"}
+    compact_progress=${compact_progress//" MB"/"MB"}
+    compact_progress=${compact_progress//" | "/" "}
     text="$compact_label: $compact_progress"
     if (( ${#text} <= max_length )); then
         printf '%s' "$text"
@@ -855,11 +849,13 @@ render_background_progress() {
     cuda_text="$(style_progress_marker "$cuda_text")"
     cudnn_text="$(style_progress_marker "$cudnn_text")"
 
-    printf '\0337\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\0338' \
-        "$BACKGROUND_PROGRESS_FIRST_ROW" "$model_text" \
-        "$((BACKGROUND_PROGRESS_FIRST_ROW + 1))" "$uv_text" \
-        "$((BACKGROUND_PROGRESS_FIRST_ROW + 2))" "$cuda_text" \
-        "$BACKGROUND_PROGRESS_ROWS" "$cudnn_text"
+    # The hidden cursor stays on progress row four. Move to row one, redraw
+    # all four rows, and finish on row four without emitting another newline.
+    printf '\033[3F\033[2K%s\r\n\033[2K%s\r\n\033[2K%s\r\n\033[2K%s' \
+        "$model_text" \
+        "$uv_text" \
+        "$cuda_text" \
+        "$cudnn_text"
 }
 
 stop_background_progress_display() {
@@ -868,16 +864,12 @@ stop_background_progress_display() {
     (( ${BACKGROUND_PROGRESS_DISPLAY_ACTIVE:-0} == 1 )) || return 0
 
     if (( preserve_output == 1 )); then
-        # Restore normal scrolling, retain the last rendered dashboard, and
-        # advance to a clean line below it before signal cleanup logs begin.
-        printf '\033[r\033[?6l\033[%d;1H\n\033[?25h' "$BACKGROUND_PROGRESS_ROWS"
+        # Retain the dashboard and leave one blank line before cleanup logs.
+        printf '\r\n\r\n\033[?7h\033[?25h'
     else
-        printf '\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[r\033[?6l\033[%d;1H\033[?25h' \
-            "$BACKGROUND_PROGRESS_FIRST_ROW" \
-            "$((BACKGROUND_PROGRESS_FIRST_ROW + 1))" \
-            "$((BACKGROUND_PROGRESS_FIRST_ROW + 2))" \
-            "$BACKGROUND_PROGRESS_ROWS" \
-            "$BACKGROUND_PROGRESS_ROWS"
+        # Clear all four rows, then return to the first so the next step uses
+        # the space previously occupied by the transient dashboard.
+        printf '\033[3F\033[2K\033[1E\033[2K\033[1E\033[2K\033[1E\033[2K\033[3F\033[?7h\033[?25h'
     fi
     BACKGROUND_PROGRESS_DISPLAY_ACTIVE=0
 }
@@ -1125,15 +1117,6 @@ uv_aggregate_download_bytes() {
         '
 }
 
-write_uv_aggregate_state() {
-    local aggregate_file=$1
-    shift
-    local temporary_file="${aggregate_file}.tmp.$$"
-
-    printf '%s\n' "$*" > "$temporary_file"
-    mv -f -- "$temporary_file" "$aggregate_file"
-}
-
 uv_download_progress() {
     local process_alive=$1
     local state=$2
@@ -1150,6 +1133,7 @@ uv_download_progress() {
     local previous_time=0
     local now
     local rate_bytes=0
+    local temporary_file
     local value
 
     case "$state" in
@@ -1195,9 +1179,11 @@ uv_download_progress() {
     if (( previous_time > 0 && now > previous_time && current_bytes >= previous_current )); then
         rate_bytes=$(( (current_bytes - previous_current) / (now - previous_time) ))
     fi
-    write_uv_aggregate_state "$aggregate_file" \
-        "$discovered_total" "$package_count" "$stable_reads" "$fixed_total" \
-        "$current_bytes" "$now"
+    temporary_file="${aggregate_file}.tmp.$$"
+    printf '%s\n' \
+        "$discovered_total $package_count $stable_reads $fixed_total $current_bytes $now" \
+        > "$temporary_file"
+    mv -f -- "$temporary_file" "$aggregate_file"
 
     if (( fixed_total == 0 )); then
         format_downloaded_megabytes "$current_bytes" "$rate_bytes"
@@ -1249,8 +1235,6 @@ show_background_download_progress() {
     BACKGROUND_PROGRESS_PRESERVE_ON_STOP=0
     BACKGROUND_PROGRESS_ROWS=0
     BACKGROUND_PROGRESS_COLUMNS=0
-    BACKGROUND_PROGRESS_FIRST_ROW=0
-    BACKGROUND_PROGRESS_CONTENT_ROWS=0
 
     start_background_progress_display || true
     trap 'stop_background_progress_display "${BACKGROUND_PROGRESS_PRESERVE_ON_STOP:-0}"' EXIT
@@ -1534,15 +1518,17 @@ finish_model_download() {
 }
 
 
-## Running Steps ##
+# Main setup flow.
 
 initialize_sudo_session
 
+# Step 1: Ensure uv is available for dependency and service commands.
 step "Install or verify uv"
 install_uv
 export PATH="$HOME/.local/bin:$PATH"
 
-download_step "Download prerequisites"
+# Step 2: Download the model, Python environment, CUDA, and cuDNN in parallel.
+step "Download prerequisites"
 cd "$ENGINE_DIR"
 ensure_download_tools
 initialize_download_progress_state
@@ -1556,7 +1542,7 @@ finish_model_download
 finish_cuda_downloads
 finish_background_download_progress
 
-
+# Step 3: Install the downloaded system prerequisites and optional tooling.
 step "Install prerequisites"
 log "All background downloads are complete. Starting installation with cached sudo authorization."
 install_cuda_and_cudnn
@@ -1577,7 +1563,7 @@ export VLLM_MODEL="$MODEL"
 export APP_PORT
 export PYTHONUNBUFFERED=1
 
-
+# Step 4: Start vLLM and wait until its health endpoint is ready.
 step "Starting vLLM with $MODEL on port $VLLM_PORT"
 setsid stdbuf -oL -eL uv run vllm serve "$LOCAL_MODEL_DIR" \
     --served-model-name "$MODEL" \
@@ -1598,6 +1584,7 @@ while ! curl -fsS "http://127.0.0.1:$VLLM_PORT/health" >/dev/null 2>&1; do
     sleep 5
 done
 
+# Step 5: Start the API application and wait until its schema is available.
 step "Start app.py on 0.0.0.0:$APP_PORT with trace logging"
 setsid stdbuf -oL -eL uv run uvicorn app:app \
     --host 0.0.0.0 \
