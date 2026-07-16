@@ -9,23 +9,15 @@ CUDA_RELEASE="12.9.1"
 CUDA_LOCAL_REPO_VERSION="12.9.1-575.57.08-1"
 CUDNN_VERSION="9.17.1"
 FFMPEG_VERSION="7.1.5"
-MODEL="prithivMLmods/gemma-4-E4B-it-FP8"
-MODEL_REVISION="main"
-MODEL_WEIGHTS="model.safetensors"
-MODEL_WEIGHTS_SIZE="13309692724"
-VLLM_PORT="8080"
-APP_PORT="7000"
 HTTP_CONNECTIONS="8"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-ENGINE_DIR="$SCRIPT_DIR/vllm_engine"
-LOCAL_MODEL_DIR="$ENGINE_DIR/models/${MODEL//\//--}"
-VLLM_PID=""
-APP_PID=""
+PROJECT_DIR="$SCRIPT_DIR"
+VENV_DIR="$PROJECT_DIR/.venv"
 INSTALL_TEMP_DIR=""
 CLEANED_UP=0
 STEP_CURRENT=0
-STEP_TOTAL=7
+STEP_TOTAL=5
 
 log() {
     printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
@@ -87,19 +79,6 @@ apt_install() {
     as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
 }
 
-stop_process_group() {
-    local pid=$1
-    [[ -n "$pid" ]] || return 0
-
-    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-}
-
-process_group_is_alive() {
-    local pid=$1
-    [[ -n "$pid" ]] || return 1
-    kill -0 -- "-$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null
-}
-
 cleanup() {
     local status=$?
     (( CLEANED_UP == 0 )) || return "$status"
@@ -111,31 +90,6 @@ cleanup() {
         INSTALL_TEMP_DIR=""
     fi
 
-    if [[ -n "$APP_PID" || -n "$VLLM_PID" ]]; then
-        log "Stopping app and vLLM processes..."
-    fi
-
-    stop_process_group "$APP_PID"
-    stop_process_group "$VLLM_PID"
-
-    local deadline=$((SECONDS + 15))
-    while (( SECONDS < deadline )); do
-        local app_alive=0
-        local vllm_alive=0
-        process_group_is_alive "$APP_PID" && app_alive=1
-        process_group_is_alive "$VLLM_PID" && vllm_alive=1
-        (( app_alive == 0 && vllm_alive == 0 )) && break
-        sleep 1
-    done
-
-    for pid in "$APP_PID" "$VLLM_PID"; do
-        [[ -n "$pid" ]] || continue
-        if process_group_is_alive "$pid"; then
-            kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-        fi
-        wait "$pid" 2>/dev/null || true
-    done
-
     exit "$status"
 }
 
@@ -143,7 +97,7 @@ handle_signal() {
     local signal=$1
     local status=$2
 
-    log "Received $signal; stopping setup and child processes..."
+    log "Received $signal; stopping setup..."
     exit "$status"
 }
 
@@ -152,52 +106,9 @@ trap 'handle_signal INT 130' INT
 trap 'handle_signal TERM 143' TERM
 trap 'handle_signal HUP 129' HUP
 
-usage() {
-    printf 'Usage: bash %s --hf-token TOKEN [--ngrok-token TOKEN]\n' "${0##*/}"
-}
+(( $# == 0 )) || die "This script does not accept arguments."
 
-HF_TOKEN=""
-NGROK_AUTHTOKEN=""
-
-while (( $# > 0 )); do
-    case "$1" in
-        --hf-token)
-            (( $# >= 2 )) || die "--hf-token requires a value."
-            [[ -z "$HF_TOKEN" ]] || die "--hf-token was specified more than once."
-            [[ -n "$2" ]] || die "--hf-token requires a non-empty value."
-            HF_TOKEN=$2
-            shift 2
-            ;;
-        --ngrok-token)
-            (( $# >= 2 )) || die "--ngrok-token requires a value."
-            [[ -z "$NGROK_AUTHTOKEN" ]] || die "--ngrok-token was specified more than once."
-            [[ -n "$2" ]] || die "--ngrok-token requires a non-empty value."
-            NGROK_AUTHTOKEN=$2
-            shift 2
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            usage >&2
-            die "Unknown argument: $1"
-            ;;
-    esac
-done
-
-[[ -n "$HF_TOKEN" ]] || die "Missing required --hf-token TOKEN."
-
-export HF_TOKEN
-export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
-if [[ -n "$NGROK_AUTHTOKEN" ]]; then
-    export NGROK_AUTHTOKEN
-    STEP_TOTAL=8
-else
-    unset NGROK_AUTHTOKEN
-fi
-# Force the stable regular-HTTP path; hf-xet 1.5.2rc0 repeatedly stalled while
-# decoding response bodies for this model, even with reduced concurrency.
+# Keep future Hugging Face CLI/model usage on the regular HTTP path.
 export HF_HUB_DISABLE_XET=1
 unset HF_XET_NUM_CONCURRENT_RANGE_GETS
 unset HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY
@@ -207,8 +118,8 @@ unset HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY
 source /etc/os-release
 [[ "${ID:-}" == "ubuntu" ]] || die "Unsupported OS: ${PRETTY_NAME:-unknown}. Ubuntu is required."
 command -v apt-get >/dev/null 2>&1 || die "apt-get was not found."
-[[ -f "$ENGINE_DIR/pyproject.toml" ]] || die "Missing $ENGINE_DIR/pyproject.toml."
-[[ -f "$ENGINE_DIR/uv.lock" ]] || die "Missing $ENGINE_DIR/uv.lock."
+[[ -f "$PROJECT_DIR/pyproject.toml" ]] || die "Missing $PROJECT_DIR/pyproject.toml."
+[[ -f "$PROJECT_DIR/uv.lock" ]] || die "Missing $PROJECT_DIR/uv.lock."
 
 case "${VERSION_ID:-}" in
     22.04) CUDA_REPO_DISTRO="ubuntu2204" ;;
@@ -254,7 +165,7 @@ install_cuda_and_cudnn() {
     local cudnn_repo_name="cudnn-local-repo-${CUDA_REPO_DISTRO}-${CUDNN_VERSION}"
     local cudnn_repo_deb="${cudnn_repo_name}_1.0-1_amd64.deb"
     local download_dir
-    local installer_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/h100-vllm/installers"
+    local installer_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/h100-vllm/cu129/installers"
     local keyring
     download_dir="$(mktemp -d)"
     INSTALL_TEMP_DIR="$download_dir"
@@ -357,36 +268,6 @@ install_uv() {
     command -v uv >/dev/null 2>&1 || die "uv installation did not produce an executable on PATH."
 }
 
-install_ngrok() {
-    if command -v ngrok >/dev/null 2>&1; then
-        log "ngrok is already installed: $(ngrok version)"
-        return
-    fi
-
-    ensure_download_tools
-    log "Installing ngrok from its official apt repository..."
-
-    local install_dir
-    install_dir="$(mktemp -d)"
-    INSTALL_TEMP_DIR="$install_dir"
-
-    curl -fsSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
-        -o "$install_dir/ngrok.asc"
-    printf '%s\n' 'deb https://ngrok-agent.s3.amazonaws.com bookworm main' \
-        > "$install_dir/ngrok.list"
-
-    as_root install -m 644 "$install_dir/ngrok.asc" \
-        /etc/apt/trusted.gpg.d/ngrok.asc
-    as_root install -m 644 "$install_dir/ngrok.list" \
-        /etc/apt/sources.list.d/ngrok.list
-    as_root apt-get update
-    apt_install ngrok
-
-    rm -rf "$install_dir"
-    INSTALL_TEMP_DIR=""
-    command -v ngrok >/dev/null 2>&1 || die "ngrok installation did not produce an executable on PATH."
-}
-
 install_ffmpeg() {
     local installed_version=""
     if command -v ffmpeg >/dev/null 2>&1; then
@@ -427,46 +308,6 @@ install_ffmpeg() {
     [[ "$(ffmpeg -version | awk 'NR == 1 { print $3 }')" == 7.* ]] || die "FFmpeg 7 installation verification failed."
 }
 
-download_model_http() {
-    local model_url="https://huggingface.co/${MODEL}/resolve/${MODEL_REVISION}/${MODEL_WEIGHTS}?download=true"
-    local downloaded_size
-
-    ensure_download_tools
-    mkdir -p "$LOCAL_MODEL_DIR"
-
-    log "Downloading model metadata and tokenizer files with Hugging Face HTTP..."
-    uv run hf download "$MODEL" \
-        --revision "$MODEL_REVISION" \
-        --local-dir "$LOCAL_MODEL_DIR" \
-        --exclude "$MODEL_WEIGHTS" \
-        --max-workers "$HTTP_CONNECTIONS"
-
-    log "Downloading $MODEL_WEIGHTS with $HTTP_CONNECTIONS resumable HTTP ranges..."
-    aria2c \
-        -x "$HTTP_CONNECTIONS" \
-        -s "$HTTP_CONNECTIONS" \
-        -k 1M \
-        -c \
-        --file-allocation=falloc \
-        --disk-cache=64M \
-        --max-tries=10 \
-        --retry-wait=3 \
-        --connect-timeout=30 \
-        --timeout=60 \
-        --console-log-level=warn \
-        --show-console-readout=true \
-        --summary-interval=0 \
-        --auto-file-renaming=false \
-        --allow-overwrite=true \
-        --dir="$LOCAL_MODEL_DIR" \
-        --out="$MODEL_WEIGHTS" \
-        "$model_url"
-
-    downloaded_size="$(stat -c '%s' "$LOCAL_MODEL_DIR/$MODEL_WEIGHTS")"
-    [[ "$downloaded_size" == "$MODEL_WEIGHTS_SIZE" ]] || \
-        die "Downloaded $MODEL_WEIGHTS is $downloaded_size bytes; expected $MODEL_WEIGHTS_SIZE bytes."
-}
-
 step "Install or verify CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION"
 install_cuda_and_cudnn
 export PATH="/usr/local/cuda-$CUDA_VERSION/bin:$HOME/.local/bin:$PATH"
@@ -474,74 +315,20 @@ export LD_LIBRARY_PATH="/usr/local/cuda-$CUDA_VERSION/lib64${LD_LIBRARY_PATH:+:$
 
 step "Install or verify uv"
 install_uv
-if [[ -n "${NGROK_AUTHTOKEN:-}" ]]; then
-    step "Install or verify ngrok"
-    install_ngrok
-else
-    log "ngrok is disabled because --ngrok-token was not provided."
-fi
 step "Install or verify FFmpeg $FFMPEG_VERSION"
 install_ffmpeg
 
-step "Synchronize locked Python dependencies in $ENGINE_DIR"
-cd "$ENGINE_DIR"
+step "Synchronize locked Python dependencies in $PROJECT_DIR"
+cd "$PROJECT_DIR"
 uv sync --frozen
 
-step "Download $MODEL over optimized HTTP"
-download_model_http
-
-export VLLM_BASE_URL="http://127.0.0.1:$VLLM_PORT/v1"
-export VLLM_MODEL="$MODEL"
-export APP_PORT
-export PYTHONUNBUFFERED=1
-
-step "Starting vLLM with $MODEL on port $VLLM_PORT"
-setsid stdbuf -oL -eL uv run vllm serve "$LOCAL_MODEL_DIR" \
-    --served-model-name "$MODEL" \
-    --port "$VLLM_PORT" \
-    --trust-remote-code \
-    --max-model-len 8192 \
-    --limit-mm-per-prompt.audio 1 \
-    --mm-processor-kwargs.audio_kwargs.max_length 480000 \
-    --gpu-memory-utilization 0.9 \
-    --uvicorn-log-level trace &
-VLLM_PID=$!
-
-while ! curl -fsS "http://127.0.0.1:$VLLM_PORT/health" >/dev/null 2>&1; do
-    kill -0 "$VLLM_PID" 2>/dev/null || {
-        wait "$VLLM_PID" || true
-        die "vLLM exited before becoming healthy."
-    }
-    sleep 5
-done
-
-step "Start app.py on 0.0.0.0:$APP_PORT with trace logging"
-setsid stdbuf -oL -eL uv run uvicorn app:app \
-    --host 0.0.0.0 \
-    --port "$APP_PORT" \
-    --log-level trace &
-APP_PID=$!
-
-while ! curl -fsS "http://127.0.0.1:$APP_PORT/openapi.json" >/dev/null 2>&1; do
-    kill -0 "$APP_PID" 2>/dev/null || {
-        wait "$APP_PID" || true
-        die "app.py exited before port $APP_PORT became ready."
-    }
-    sleep 1
-done
+step "Activate the virtual environment and open a CLI shell"
+[[ -f "$VENV_DIR/bin/activate" ]] || die "uv sync completed, but $VENV_DIR/bin/activate was not found."
+[[ -x "$VENV_DIR/bin/vllm" ]] || die "uv sync completed, but the vLLM CLI was not found in $VENV_DIR/bin."
 
 SETUP_ELAPSED_SECONDS=$((SECONDS - SETUP_START_SECONDS))
-log "API is listening on port $APP_PORT. Setup completed in $(format_duration "$SETUP_ELAPSED_SECONDS"). Press Ctrl+C to stop app.py and vLLM."
+log "Setup completed in $(format_duration "$SETUP_ELAPSED_SECONDS"). Opening an activated CLI shell."
+log "Run 'vllm --help' to get started; run 'exit' to leave the environment."
 
-set +e
-wait -n "$VLLM_PID" "$APP_PID"
-status=$?
-set -e
-
-if ! kill -0 "$VLLM_PID" 2>/dev/null; then
-    log "vLLM exited with status $status."
-else
-    log "app.py exited with status $status."
-fi
-
-exit "$status"
+trap - EXIT INT TERM HUP
+exec "$BASH" --rcfile "$VENV_DIR/bin/activate" -i
