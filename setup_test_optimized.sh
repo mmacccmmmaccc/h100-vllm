@@ -598,31 +598,66 @@ install_cuda_and_cudnn() {
     download_dir="$(mktemp -d)"
     INSTALL_TEMP_DIR="$download_dir"
 
-    if (( cuda_needed == 1 )); then
-        wget -qO "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
-            "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_REPO_DISTRO}/x86_64/cuda-${CUDA_REPO_DISTRO}.pin"
-        as_root install -m 644 \
-            "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
-            /etc/apt/preferences.d/cuda-repository-pin-600
+    wget -qO "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
+        "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_REPO_DISTRO}/x86_64/cuda-${CUDA_REPO_DISTRO}.pin"
+    as_root install -m 644 \
+        "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
+        /etc/apt/preferences.d/cuda-repository-pin-600
+
+    if dpkg-query -W -f='${Status}' "$repo_name" 2>/dev/null | grep -q 'ok installed' \
+        && [[ -d "/var/$repo_name" ]]; then
+        log "Reusing the existing CUDA local repository in /var/$repo_name."
+    else
+        aria2c \
+            -x "$HTTP_CONNECTIONS" \
+            -s "$HTTP_CONNECTIONS" \
+            -k 1M \
+            -c \
+            --file-allocation=falloc \
+            --disk-cache=64M \
+            --max-tries=10 \
+            --retry-wait=3 \
+            --connect-timeout=30 \
+            --timeout=60 \
+            --console-log-level=warn \
+            --show-console-readout=false \
+            --summary-interval=0 \
+            --auto-file-renaming=false \
+            --allow-overwrite=true \
+            --dir="$installer_cache_dir" \
+            --out="$repo_deb" \
+            "https://developer.download.nvidia.com/compute/cuda/${CUDA_RELEASE}/local_installers/${repo_deb}"
+        as_root dpkg -i "$installer_cache_dir/$repo_deb"
+        rm -f "$installer_cache_dir/$repo_deb" "$installer_cache_dir/${repo_deb}.aria2"
     fi
 
     finish_cuda_downloads
 
-    if (( cuda_needed == 1 )); then
-        if nvidia_repo_is_ready "$CUDA_REPO_NAME"; then
-            log "Reusing the existing CUDA local repository in /var/$CUDA_REPO_NAME."
-        else
-            [[ -f "$INSTALLER_CACHE_DIR/$CUDA_REPO_DEB" ]] || \
-                die "The downloaded CUDA repository package was not found at $INSTALLER_CACHE_DIR/$CUDA_REPO_DEB."
-            as_root dpkg -i "$INSTALLER_CACHE_DIR/$CUDA_REPO_DEB"
-            rm -f "$INSTALLER_CACHE_DIR/$CUDA_REPO_DEB" "$INSTALLER_CACHE_DIR/${CUDA_REPO_DEB}.aria2"
-        fi
-
-        keyring="$(find "/var/$CUDA_REPO_NAME" -maxdepth 1 -type f -name 'cuda-*-keyring.gpg' -print -quit)"
-        [[ -n "$keyring" ]] || die "CUDA local repository keyring was not found in /var/$CUDA_REPO_NAME."
-        as_root cp "$keyring" /usr/share/keyrings/
-        packages+=("cuda-toolkit-12-9")
-        repo_packages+=("$CUDA_REPO_NAME")
+    if dpkg-query -W -f='${Status}' "$cudnn_repo_name" 2>/dev/null | grep -q 'ok installed' \
+        && [[ -d "/var/$cudnn_repo_name" ]]; then
+        log "Reusing the existing cuDNN local repository in /var/$cudnn_repo_name."
+    else
+        aria2c \
+            -x "$HTTP_CONNECTIONS" \
+            -s "$HTTP_CONNECTIONS" \
+            -k 1M \
+            -c \
+            --file-allocation=falloc \
+            --disk-cache=64M \
+            --max-tries=10 \
+            --retry-wait=3 \
+            --connect-timeout=30 \
+            --timeout=60 \
+            --console-log-level=warn \
+            --show-console-readout=false \
+            --summary-interval=0 \
+            --auto-file-renaming=false \
+            --allow-overwrite=true \
+            --dir="$installer_cache_dir" \
+            --out="$cudnn_repo_deb" \
+            "https://developer.download.nvidia.com/compute/cudnn/${CUDNN_VERSION}/local_installers/${cudnn_repo_deb}"
+        as_root dpkg -i "$installer_cache_dir/$cudnn_repo_deb"
+        rm -f "$installer_cache_dir/$cudnn_repo_deb" "$installer_cache_dir/${cudnn_repo_deb}.aria2"
     fi
 
     if (( cudnn_needed == 1 )); then
@@ -676,659 +711,12 @@ install_uv() {
 
 # Live download dashboard.
 start_uv_sync() {
-    log "Starting locked Python dependency synchronization with uv..."
-    # uv only emits its live download bars to a terminal. Give it a private PTY
-    # while keeping every raw control sequence and process message in the log.
-    start_state_tracked_background_process \
-        "$UV_PROGRESS_STATE_FILE" \
-        "$UV_SYNC_LOG" \
-        UV_SYNC_PID \
-        script -q -e -f -c 'uv sync --frozen' /dev/null
-}
-
-terminal_size() {
-    local rows
-    local columns
-
-    rows="$(tput lines 2>/dev/null || true)"
-    columns="$(tput cols 2>/dev/null || true)"
-    if ! [[ "$rows" =~ ^[0-9]+$ ]] || (( rows < 1 )); then
-        rows="${LINES:-24}"
-        [[ "$rows" =~ ^[0-9]+$ ]] && (( rows >= 1 )) || rows=24
-    fi
-    if ! [[ "$columns" =~ ^[0-9]+$ ]] || (( columns < 1 )); then
-        columns="${COLUMNS:-80}"
-        [[ "$columns" =~ ^[0-9]+$ ]] && (( columns >= 1 )) || columns=80
-    fi
-
-    printf '%s %s\n' "$rows" "$columns"
-}
-
-activate_background_progress_display() {
-    local rows=$1
-    local columns=$2
-
-    BACKGROUND_PROGRESS_ROWS=$rows
-    BACKGROUND_PROGRESS_COLUMNS=$columns
-    BACKGROUND_PROGRESS_DISPLAY_ACTIVE=1
-
-    # Preserve the current output position while clearing any margin left by
-    # an interrupted older run. The parent separator has placed the cursor on
-    # progress row one; add three rows and keep the cursor on progress row four.
-    printf '\0337\033[?6l\033[r\0338\033[?25l\033[?7l\r\n\r\n\r\n'
-}
-
-start_background_progress_display() {
-    local rows
-    local columns
-
-    BACKGROUND_PROGRESS_DISPLAY_ACTIVE=0
-    if [[ ! -t 1 || "${TERM:-dumb}" == "dumb" ]]; then
-        return 1
-    fi
-
-    read -r rows columns < <(terminal_size)
-    if (( rows < 8 || columns < 60 )); then
-        return 1
-    fi
-    activate_background_progress_display "$rows" "$columns"
-}
-
-refresh_background_progress_display() {
-    local rows
-    local columns
-
-    [[ -t 1 && "${TERM:-dumb}" != "dumb" ]] || return 0
-    read -r rows columns < <(terminal_size)
-
-    if (( rows < 8 || columns < 60 )); then
-        stop_background_progress_display
-        return
-    fi
-    if (( BACKGROUND_PROGRESS_DISPLAY_ACTIVE == 0 )); then
-        activate_background_progress_display "$rows" "$columns"
-    elif (( rows != BACKGROUND_PROGRESS_ROWS || columns != BACKGROUND_PROGRESS_COLUMNS )); then
-        BACKGROUND_PROGRESS_ROWS=$rows
-        BACKGROUND_PROGRESS_COLUMNS=$columns
-    fi
-}
-
-fit_dashboard_progress_row() {
-    local full_label=$1
-    local compact_label=$2
-    local progress=$3
-    local max_length=$4
-    local compact_progress
-    local percentage=""
-    local text="$full_label: $progress"
-    local available_label_length
-
-    if (( ${#text} <= max_length )); then
-        printf '%s' "$text"
-        return
-    fi
-
-    compact_progress=${progress//" / "/"/"}
-    compact_progress=${compact_progress//" MB"/"MB"}
-    compact_progress=${compact_progress//" | "/" "}
-    text="$compact_label: $compact_progress"
-    if (( ${#text} <= max_length )); then
-        printf '%s' "$text"
-        return
-    fi
-    if [[ "$compact_progress" =~ [[:space:]]\([0-9]{1,3}%\) ]]; then
-        percentage=${BASH_REMATCH[0]}
-        compact_progress=${compact_progress/"$percentage"/}
-    fi
-    text="$compact_label: $compact_progress"
-    if (( ${#text} <= max_length )); then
-        printf '%s' "$text"
-        return
-    fi
-    available_label_length=$((max_length - ${#compact_progress} - 2))
-    if (( available_label_length >= 2 )); then
-        compact_label="${compact_label:0:available_label_length}"
-        if (( ${#compact_label} == available_label_length )); then
-            compact_label="${compact_label:0:available_label_length - 1}~"
-        fi
-        printf '%s: %s' "$compact_label" "$compact_progress"
-    else
-        printf '%s' "${compact_progress:0:max_length}"
-    fi
-}
-
-style_progress_marker() {
-    local text=$1
-    local marker
-    local prefix
-    local suffix
-
-    if [[ "$text" == *'[ COMPLETE ]'* ]]; then
-        marker='[ COMPLETE ]'
-        prefix=${text%%"$marker"*}
-        suffix=${text#*"$marker"}
-        text="${prefix}"$'\033[1;92m'"${marker}"$'\033[0m'"${suffix}"
-    elif [[ "$text" == *'[ FAILED ]'* ]]; then
-        marker='[ FAILED ]'
-        prefix=${text%%"$marker"*}
-        suffix=${text#*"$marker"}
-        text="${prefix}"$'\033[1;91m'"${marker}"$'\033[0m'"${suffix}"
-    fi
-    printf '%s' "$text"
-}
-
-render_background_progress() {
-    local model_progress=$1
-    local uv_progress=$2
-    local cuda_progress=$3
-    local cudnn_progress=$4
-    local model_text
-    local uv_text
-    local cuda_text
-    local cudnn_text
-    local max_length=$((BACKGROUND_PROGRESS_COLUMNS - 1))
-
-    (( BACKGROUND_PROGRESS_DISPLAY_ACTIVE == 1 )) || return 0
-    model_progress="${model_progress//$'\r'/ }"
-    model_progress="${model_progress//$'\n'/ }"
-    uv_progress="${uv_progress//$'\r'/ }"
-    uv_progress="${uv_progress//$'\n'/ }"
-    cuda_progress="${cuda_progress//$'\r'/ }"
-    cuda_progress="${cuda_progress//$'\n'/ }"
-    cudnn_progress="${cudnn_progress//$'\r'/ }"
-    cudnn_progress="${cudnn_progress//$'\n'/ }"
-    model_text="$(fit_dashboard_progress_row \
-        "Model ($MODEL)" "Model (${MODEL##*/})" "$model_progress" "$max_length")"
-    uv_text="$(fit_dashboard_progress_row \
-        'vLLM' 'vLLM' "$uv_progress" "$max_length")"
-    cuda_text="$(fit_dashboard_progress_row \
-        "CUDA Toolkit $CUDA_VERSION" 'CUDA Toolkit' "$cuda_progress" "$max_length")"
-    cudnn_text="$(fit_dashboard_progress_row \
-        "cuDNN $CUDNN_VERSION" 'cuDNN' "$cudnn_progress" "$max_length")"
-    model_text="$(style_progress_marker "$model_text")"
-    uv_text="$(style_progress_marker "$uv_text")"
-    cuda_text="$(style_progress_marker "$cuda_text")"
-    cudnn_text="$(style_progress_marker "$cudnn_text")"
-
-    # The hidden cursor stays on progress row four. Move to row one, redraw
-    # all four rows, and finish on row four without emitting another newline.
-    printf '\033[3F\033[2K%s\r\n\033[2K%s\r\n\033[2K%s\r\n\033[2K%s' \
-        "$model_text" \
-        "$uv_text" \
-        "$cuda_text" \
-        "$cudnn_text"
-}
-
-stop_background_progress_display() {
-    local preserve_output=${1:-0}
-
-    (( ${BACKGROUND_PROGRESS_DISPLAY_ACTIVE:-0} == 1 )) || return 0
-
-    if (( preserve_output == 1 )); then
-        # Retain the dashboard and leave one blank line before cleanup logs.
-        printf '\r\n\r\n\033[?7h\033[?25h'
-    else
-        # Clear all four rows, then return to the first so the next step uses
-        # the space previously occupied by the transient dashboard.
-        printf '\033[3F\033[2K\033[1E\033[2K\033[1E\033[2K\033[1E\033[2K\033[3F\033[?7h\033[?25h'
-    fi
-    BACKGROUND_PROGRESS_DISPLAY_ACTIVE=0
-}
-
-format_transfer_metrics() {
-    local current_value=$1
-    local current_unit=$2
-    local total_value=$3
-    local total_unit=$4
-    local percent=$5
-    local rate_value=$6
-    local rate_unit=$7
-
-    LC_ALL=C awk \
-        -v current_value="$current_value" \
-        -v current_unit="$current_unit" \
-        -v total_value="$total_value" \
-        -v total_unit="$total_unit" \
-        -v percent="$percent" \
-        -v rate_value="$rate_value" \
-        -v rate_unit="$rate_unit" '
-        function unit_bytes(unit) {
-            if (unit == "B")   return 1
-            if (unit == "KB")  return 1000
-            if (unit == "MB")  return 1000000
-            if (unit == "GB")  return 1000000000
-            if (unit == "TB")  return 1000000000000
-            if (unit == "KiB") return 1024
-            if (unit == "MiB") return 1048576
-            if (unit == "GiB") return 1073741824
-            if (unit == "TiB") return 1099511627776
-            return 0
-        }
-        function display_mb(value) {
-            if (value < 10) return sprintf("%.2f", value)
-            return sprintf("%.1f", value)
-        }
-        BEGIN {
-            current_factor = unit_bytes(current_unit)
-            total_factor = unit_bytes(total_unit)
-            rate_factor = (rate_value == "" ? 1 : unit_bytes(rate_unit))
-            if (current_factor == 0 || total_factor == 0 || rate_factor == 0) exit 2
-            current_mb = current_value * current_factor / 1000000
-            total_mb = total_value * total_factor / 1000000
-            if (percent == "" && total_mb > 0) {
-                percent = int((current_mb * 100 / total_mb) + 0.000001)
-                if (current_mb < total_mb && percent >= 100) percent = 99
-            }
-            if (percent + 0 > 100) percent = 100
-            printf "%s / %s MB", display_mb(current_mb), display_mb(total_mb)
-            if (percent != "") printf " (%d%%)", percent
-            if (rate_value != "") {
-                rate_mb = rate_value * rate_factor / 1000000
-                printf " | %s MB/s", display_mb(rate_mb)
-            }
-        }
-    '
-}
-
-format_downloaded_megabytes() {
-    local current_bytes=$1
-    local rate_bytes=$2
-
-    LC_ALL=C awk -v current_bytes="$current_bytes" -v rate_bytes="$rate_bytes" '
-        function display_mb(value) {
-            if (value < 10) return sprintf("%.2f", value)
-            return sprintf("%.1f", value)
-        }
-        BEGIN {
-            printf "%s MB | %s MB/s", \
-                display_mb(current_bytes / 1000000), \
-                display_mb(rate_bytes / 1000000)
-        }
-    '
-}
-
-normalize_download_progress() {
-    local progress_line=$1
-    local current_value=""
-    local current_unit=""
-    local total_value=""
-    local total_unit=""
-    local percent=""
-    local rate_value=""
-    local rate_unit=""
-
-    if [[ "$progress_line" =~ ([0-9]+([.][0-9]+)?)[[:space:]]*([KMGT]?i?B)[[:space:]]*/[[:space:]]*([0-9]+([.][0-9]+)?)[[:space:]]*([KMGT]?i?B) ]]; then
-        current_value=${BASH_REMATCH[1]}
-        current_unit=${BASH_REMATCH[3]}
-        total_value=${BASH_REMATCH[4]}
-        total_unit=${BASH_REMATCH[6]}
-        if [[ "$progress_line" =~ \([[:space:]]*([0-9]{1,3})%[[:space:]]*\) ]]; then
-            percent=${BASH_REMATCH[1]}
-        fi
-        if [[ "$progress_line" =~ DL:[[:space:]]*([0-9]+([.][0-9]+)?)[[:space:]]*([KMGT]?i?B) ]]; then
-            rate_value=${BASH_REMATCH[1]}
-            rate_unit=${BASH_REMATCH[3]}
-        elif [[ "$progress_line" =~ ([0-9]+([.][0-9]+)?)[[:space:]]*([KMGT]?i?B)[[:space:]]*/s ]]; then
-            rate_value=${BASH_REMATCH[1]}
-            rate_unit=${BASH_REMATCH[3]}
-        fi
-        format_transfer_metrics \
-            "$current_value" "$current_unit" "$total_value" "$total_unit" \
-            "$percent" "$rate_value" "$rate_unit" || true
-        return
-    fi
-
-    # uv announces large artifacts before its first byte-level progress update.
-    if [[ "$progress_line" =~ \(([0-9]+([.][0-9]+)?)[[:space:]]*([KMGT]?i?B)\) ]]; then
-        format_transfer_metrics 0 B "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "" "" "" || true
-    fi
-}
-
-format_progress_display() {
-    local progress=$1
-
-    case "$progress" in
-        complete) progress='[ COMPLETE ]' ;;
-        'ready (cached)') progress='[ COMPLETE ] cached' ;;
-        'ready (installed)') progress='[ COMPLETE ] installed' ;;
-        failed) progress='[ FAILED ]' ;;
-        'metadata failed') progress='[ FAILED ] metadata' ;;
-    esac
-    printf '%s' "$progress"
-}
-
-aria2_download_progress() {
-    local log_file=$1
-    local process_alive=$2
-    local state=$3
-    local progress_line=""
-    local progress=""
-
-    case "$state" in
-        cached) printf 'ready (cached)'; return ;;
-        installed) printf 'ready (installed)'; return ;;
-        complete) printf 'complete'; return ;;
-        failed) printf 'failed'; return ;;
-        pending) printf 'queued'; return ;;
-    esac
-    if (( process_alive == 0 )); then
-        printf 'verifying'
-        return
-    fi
-
-    progress_line="$(
-        tail -c 65536 -- "$log_file" 2>/dev/null \
-            | tr '\r' '\n' \
-            | sed -E $'s/\033\\[[0-9;?]*[ -/]*[@-~]//g' \
-            | grep -E '\([[:space:]]*[0-9]{1,3}%[[:space:]]*\)' \
-            | tail -n 1 \
-            || true
-    )"
-    progress="$(normalize_download_progress "$progress_line")"
-    printf '%s' "${progress:-starting}"
-}
-
-uv_aggregate_download_bytes() {
-    tr '\r' '\n' < "$UV_SYNC_LOG" 2>/dev/null \
-        | sed -E $'s/\033\\[[0-9;?]*[ -/]*[@-~]//g' \
-        | LC_ALL=C awk '
-            function trim(value) {
-                sub(/^[[:space:]]+/, "", value)
-                sub(/[[:space:]]+$/, "", value)
-                return value
-            }
-            function unit_bytes(unit) {
-                if (unit == "B")   return 1
-                if (unit == "KB")  return 1000
-                if (unit == "MB")  return 1000000
-                if (unit == "GB")  return 1000000000
-                if (unit == "TB")  return 1000000000000
-                if (unit == "KiB") return 1024
-                if (unit == "MiB") return 1048576
-                if (unit == "GiB") return 1073741824
-                if (unit == "TiB") return 1099511627776
-                return 0
-            }
-            function size_bytes(text, value, unit, factor) {
-                gsub(/[[:space:]]/, "", text)
-                value = text
-                sub(/[[:alpha:]].*$/, "", value)
-                unit = text
-                sub(/^[0-9.]+/, "", unit)
-                factor = unit_bytes(unit)
-                if (value !~ /^[0-9]+([.][0-9]+)?$/ || factor == 0) return 0
-                return value * factor
-            }
-            {
-                line = trim($0)
-
-                if (line ~ /^Downloading[[:space:]]+/ && line ~ /\([0-9.]+[[:space:]]*[KMGT]?i?B\)[[:space:]]*$/) {
-                    name = line
-                    sub(/^Downloading[[:space:]]+/, "", name)
-                    size = name
-                    sub(/^.*\(/, "", size)
-                    sub(/\).*$/, "", size)
-                    sub(/[[:space:]]+\([^()]+\)[[:space:]]*$/, "", name)
-                    bytes = size_bytes(size)
-                    if (bytes > 0) {
-                        totals[name] = bytes
-                        if (!(name in currents)) currents[name] = 0
-                    }
-                }
-
-                ratio_line = line
-                gsub(/\//, " / ", ratio_line)
-                field_count = split(ratio_line, fields, /[[:space:]]+/)
-                if (field_count >= 6 \
-                    && fields[field_count - 4] ~ /^[0-9]+([.][0-9]+)?$/ \
-                    && unit_bytes(fields[field_count - 3]) > 0 \
-                    && fields[field_count - 2] == "/" \
-                    && fields[field_count - 1] ~ /^[0-9]+([.][0-9]+)?$/ \
-                    && unit_bytes(fields[field_count]) > 0) {
-                    name = fields[1]
-                    current_bytes = fields[field_count - 4] * unit_bytes(fields[field_count - 3])
-                    total_bytes = fields[field_count - 1] * unit_bytes(fields[field_count])
-                    if (name != "" && total_bytes > 0) {
-                        totals[name] = total_bytes
-                        currents[name] = current_bytes
-                        active_progress = 1
-                    }
-                }
-
-                if (line ~ /^Downloaded[[:space:]]+/) {
-                    split(line, downloaded_fields, /[[:space:]]+/)
-                    name = downloaded_fields[2]
-                    if (name in totals) currents[name] = totals[name]
-                    active_progress = 1
-                }
-            }
-            END {
-                total_bytes = 0
-                current_bytes = 0
-                package_count = 0
-                for (name in totals) {
-                    total_bytes += totals[name]
-                    value = currents[name]
-                    if (value > totals[name]) value = totals[name]
-                    if (value > 0) current_bytes += value
-                    package_count++
-                }
-                printf "%.0f %.0f %d %d\n", current_bytes, total_bytes, package_count, active_progress
-            }
-        '
-}
-
-uv_download_progress() {
-    local process_alive=$1
-    local state=$2
-    local aggregate_file="${UV_PROGRESS_STATE_FILE}.aggregate"
-    local current_bytes=0
-    local discovered_total=0
-    local package_count=0
-    local active_progress=0
-    local previous_total=0
-    local previous_count=0
-    local stable_reads=0
-    local fixed_total=0
-    local previous_current=0
-    local previous_time=0
-    local now
-    local rate_bytes=0
-    local temporary_file
-    local value
-
-    case "$state" in
-        complete) printf 'complete'; return ;;
-        failed) printf 'failed'; return ;;
-        pending) printf 'queued'; return ;;
-    esac
-    if (( process_alive == 0 )); then
-        printf 'verifying'
-        return
-    fi
-
-    read -r current_bytes discovered_total package_count active_progress \
-        < <(uv_aggregate_download_bytes)
-    if [[ -f "$aggregate_file" ]]; then
-        read -r previous_total previous_count stable_reads fixed_total \
-            previous_current previous_time < "$aggregate_file" || true
-    fi
-    for value in current_bytes discovered_total package_count active_progress \
-        previous_total previous_count stable_reads fixed_total previous_current previous_time; do
-        [[ "${!value}" =~ ^[0-9]+$ ]] || printf -v "$value" '%s' 0
-    done
-
-    now="$(date +%s)"
-    if (( fixed_total > 0 && discovered_total > fixed_total )); then
-        fixed_total=0
-        stable_reads=0
-    fi
-    # Do not display a numeric total until uv has started transferring and the
-    # deduplicated package total is unchanged across consecutive refreshes.
-    if (( fixed_total == 0 )); then
-        if (( discovered_total > 0 && active_progress == 1 \
-            && discovered_total == previous_total && package_count == previous_count )); then
-            (( stable_reads += 1 ))
-        else
-            stable_reads=0
-        fi
-        if (( stable_reads >= 1 )); then
-            fixed_total=$discovered_total
-        fi
-    fi
-
-    if (( previous_time > 0 && now > previous_time && current_bytes >= previous_current )); then
-        rate_bytes=$(( (current_bytes - previous_current) / (now - previous_time) ))
-    fi
-    temporary_file="${aggregate_file}.tmp.$$"
-    printf '%s\n' \
-        "$discovered_total $package_count $stable_reads $fixed_total $current_bytes $now" \
-        > "$temporary_file"
-    mv -f -- "$temporary_file" "$aggregate_file"
-
-    if (( fixed_total == 0 )); then
-        format_downloaded_megabytes "$current_bytes" "$rate_bytes"
-        return
-    fi
-    (( current_bytes > fixed_total )) && current_bytes=$fixed_total
-    format_transfer_metrics "$current_bytes" B "$fixed_total" B "" "$rate_bytes" B
-}
-
-model_metadata_download_progress() {
-    local progress_line=""
-
-    progress_line="$(
-        tail -c 65536 -- "$MODEL_METADATA_LOG" 2>/dev/null \
-            | tr '\r' '\n' \
-            | sed -E $'s/\033\\[[0-9;?]*[ -/]*[@-~]//g' \
-            | grep -E '([0-9]+%|(^|[[:space:]])(Fetching|Downloading|Downloaded)([[:space:]]|$))' \
-            | tail -n 1 \
-            || true
-    )"
-    if [[ "$progress_line" =~ ([0-9]{1,3})% ]]; then
-        printf 'metadata (%s%%)' "${BASH_REMATCH[1]}"
-    else
-        printf 'metadata'
-    fi
-}
-
-show_background_download_progress() {
-    local model_pid=$1
-    local uv_pid=$2
-    local cuda_pid=$3
-    local cudnn_pid=$4
-    local model_alive
-    local uv_alive
-    local cuda_alive
-    local cudnn_alive
-    local model_state
-    local model_metadata_state
-    local uv_state
-    local cuda_state
-    local cudnn_state
-    local model_progress
-    local uv_progress
-    local cuda_progress
-    local cudnn_progress
-    local stop_mode=""
-
-    BACKGROUND_PROGRESS_DISPLAY_ACTIVE=0
-    BACKGROUND_PROGRESS_PRESERVE_ON_STOP=0
-    BACKGROUND_PROGRESS_ROWS=0
-    BACKGROUND_PROGRESS_COLUMNS=0
-
-    start_background_progress_display || true
-    trap 'stop_background_progress_display "${BACKGROUND_PROGRESS_PRESERVE_ON_STOP:-0}"' EXIT
-    trap 'BACKGROUND_PROGRESS_PRESERVE_ON_STOP=1; exit 0' INT TERM HUP
-
-    while [[ ! -e "$BACKGROUND_PROGRESS_STOP_FILE" ]]; do
-        model_alive=0
-        uv_alive=0
-        cuda_alive=0
-        cudnn_alive=0
-        [[ -n "$model_pid" ]] && kill -0 "$model_pid" 2>/dev/null && model_alive=1
-        [[ -n "$uv_pid" ]] && kill -0 "$uv_pid" 2>/dev/null && uv_alive=1
-        [[ -n "$cuda_pid" ]] && kill -0 "$cuda_pid" 2>/dev/null && cuda_alive=1
-        [[ -n "$cudnn_pid" ]] && kill -0 "$cudnn_pid" 2>/dev/null && cudnn_alive=1
-
-        model_state="$(read_progress_state "$MODEL_PROGRESS_STATE_FILE")"
-        model_metadata_state="$(read_progress_state "$MODEL_METADATA_PROGRESS_STATE_FILE")"
-        uv_state="$(read_progress_state "$UV_PROGRESS_STATE_FILE")"
-        cuda_state="$(read_progress_state "$CUDA_PROGRESS_STATE_FILE")"
-        cudnn_state="$(read_progress_state "$CUDNN_PROGRESS_STATE_FILE")"
-
-        if [[ "$model_state" == failed ]]; then
-            model_progress="failed"
-        elif [[ "$model_metadata_state" == failed ]]; then
-            model_progress="metadata failed"
-        elif [[ "$model_state" == running ]]; then
-            model_progress="$(aria2_download_progress "$MODEL_DOWNLOAD_LOG" "$model_alive" "$model_state")"
-        elif [[ "$model_metadata_state" == running ]]; then
-            model_progress="$(model_metadata_download_progress)"
-        elif [[ "$model_metadata_state" == verifying ]]; then
-            model_progress="verifying"
-        elif [[ "$model_metadata_state" == complete \
-            && ( "$model_state" == complete || "$model_state" == cached ) ]]; then
-            model_progress="complete"
-        elif [[ "$model_state" == complete ]]; then
-            model_progress="weights downloaded"
-        elif [[ "$model_state" == cached ]]; then
-            model_progress="weights cached"
-        else
-            model_progress="$(aria2_download_progress "$MODEL_DOWNLOAD_LOG" "$model_alive" "$model_state")"
-        fi
-        uv_progress="$(uv_download_progress "$uv_alive" "$uv_state")"
-        cuda_progress="$(aria2_download_progress "$CUDA_DOWNLOAD_LOG" "$cuda_alive" "$cuda_state")"
-        cudnn_progress="$(aria2_download_progress "$CUDNN_DOWNLOAD_LOG" "$cudnn_alive" "$cudnn_state")"
-
-        model_progress="$(format_progress_display "$model_progress")"
-        uv_progress="$(format_progress_display "$uv_progress")"
-        cuda_progress="$(format_progress_display "$cuda_progress")"
-        cudnn_progress="$(format_progress_display "$cudnn_progress")"
-
-        refresh_background_progress_display
-        render_background_progress \
-            "$model_progress" \
-            "$uv_progress" \
-            "$cuda_progress" \
-            "$cudnn_progress"
-        sleep "$BACKGROUND_PROGRESS_INTERVAL"
-    done
-
-    if IFS= read -r stop_mode < "$BACKGROUND_PROGRESS_STOP_FILE" \
-        && [[ "$stop_mode" == preserve ]]; then
-        BACKGROUND_PROGRESS_PRESERVE_ON_STOP=1
-    fi
-}
-
-start_background_download_progress() {
-    if [[ -z "$MODEL_DOWNLOAD_PID" && -z "$UV_SYNC_PID" \
-        && -z "$CUDA_DOWNLOAD_PID" && -z "$CUDNN_DOWNLOAD_PID" ]]; then
-        return
-    fi
-
-    show_background_download_progress \
-        "$MODEL_DOWNLOAD_PID" \
-        "$UV_SYNC_PID" \
-        "$CUDA_DOWNLOAD_PID" \
-        "$CUDNN_DOWNLOAD_PID" &
-    BACKGROUND_PROGRESS_PID=$!
-}
-
-finish_background_download_progress() {
-    if [[ -n "$BACKGROUND_PROGRESS_PID" ]]; then
-        : > "$BACKGROUND_PROGRESS_STOP_FILE"
-        wait "$BACKGROUND_PROGRESS_PID" 2>/dev/null || true
-        BACKGROUND_PROGRESS_PID=""
-    fi
-}
-
-finish_background_download_progress_for_signal() {
-    if [[ -n "$BACKGROUND_PROGRESS_PID" ]]; then
-        printf 'preserve\n' > "$BACKGROUND_PROGRESS_STOP_FILE"
-        wait "$BACKGROUND_PROGRESS_PID" 2>/dev/null || true
-        BACKGROUND_PROGRESS_PID=""
-    fi
+    log "Starting locked Python dependency synchronization in the background..."
+    rm -f "$UV_SYNC_LOG"
+    setsid bash -o pipefail -c '
+        stdbuf -oL -eL uv sync --frozen 2>&1 | tee "$1"
+    ' bash "$UV_SYNC_LOG" &
+    UV_SYNC_PID=$!
 }
 
 finish_uv_sync() {
