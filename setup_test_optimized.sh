@@ -47,7 +47,7 @@ INSTALL_TEMP_DIR=""
 CLEANED_UP=0
 APT_UPDATED=0
 CUDA_DOWNLOADS_STARTED=0
-INTERACTIVE_SUDO_ALLOWED=0
+SUDO_KEEPALIVE_PID=""
 STEP_CURRENT=0
 STEP_TOTAL=6
 CURRENT_STEP_LABEL=""
@@ -189,14 +189,45 @@ as_root() {
         "$@"
     else
         command -v sudo >/dev/null 2>&1 || die "sudo is required to install system packages."
-        if (( INTERACTIVE_SUDO_ALLOWED == 0 )); then
-            sudo -n true 2>/dev/null || die \
-                "A privileged download prerequisite is missing. To keep loading password-free, install aria2, ca-certificates, curl, and wget before running this script."
-            sudo -n "$@"
-        else
-            sudo "$@"
-        fi
+        sudo -n -v >/dev/null 2>&1 || die \
+            "Cached sudo authorization expired. Rerun the setup so authorization can be requested at the beginning."
+        sudo -n "$@"
     fi
+}
+
+initialize_sudo_session() {
+    (( EUID != 0 )) || return 0
+    command -v sudo >/dev/null 2>&1 || die "sudo is required to install system packages."
+
+    log "Requesting sudo authorization once before downloads begin..."
+    sudo -v || die "Unable to obtain sudo authorization."
+    sudo -n -v >/dev/null 2>&1 || die \
+        "This sudo policy does not allow credentials to remain cached for password-free installation."
+
+    # Refresh the timestamp without prompting while downloads and builds run.
+    (
+        sleep_pid=""
+        trap '
+            [[ -z "$sleep_pid" ]] || kill "$sleep_pid" 2>/dev/null || true
+            exit 0
+        ' TERM INT HUP
+        while :; do
+            sleep 45 &
+            sleep_pid=$!
+            wait "$sleep_pid" || exit 0
+            sleep_pid=""
+            sudo -n -v >/dev/null 2>&1 || exit 1
+        done
+    ) >/dev/null 2>&1 &
+    SUDO_KEEPALIVE_PID=$!
+    log "Sudo authorization cached; later privileged commands will not prompt."
+}
+
+stop_sudo_keepalive() {
+    [[ -n "$SUDO_KEEPALIVE_PID" ]] || return 0
+    kill -TERM "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    SUDO_KEEPALIVE_PID=""
 }
 
 apt_install() {
@@ -239,6 +270,7 @@ cleanup() {
         fi
     fi
     BACKGROUND_PROGRESS_DASHBOARD_ACTIVE=0
+    stop_sudo_keepalive
 
     if [[ -n "$APP_PID" || -n "$VLLM_PID" || -n "$MODEL_DOWNLOAD_PID" \
         || -n "$UV_SYNC_PID" || -n "$CUDA_DOWNLOAD_PID" \
@@ -1547,6 +1579,8 @@ finish_model_download() {
 
 ## Running Steps ##
 
+initialize_sudo_session
+
 step "Install or verify uv"
 install_uv
 export PATH="$HOME/.local/bin:$PATH"
@@ -1564,8 +1598,7 @@ step "Finish all background downloads before privileged installation"
 finish_uv_sync
 finish_model_download
 finish_cuda_downloads
-INTERACTIVE_SUDO_ALLOWED=1
-log "All background downloads are complete. Privileged installation may now request sudo access."
+log "All background downloads are complete. Starting installation with cached sudo authorization."
 
 
 step "Install or verify CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION"
@@ -1582,6 +1615,7 @@ fi
 
 step "Install or verify FFmpeg $FFMPEG_VERSION"
 install_ffmpeg
+stop_sudo_keepalive
 
 export VLLM_BASE_URL="http://127.0.0.1:$VLLM_PORT/v1"
 export VLLM_MODEL="$MODEL"
