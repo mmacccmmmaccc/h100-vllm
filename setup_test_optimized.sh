@@ -33,7 +33,10 @@ UV_SYNC_PID=""
 CUDA_DOWNLOAD_PID=""
 CUDNN_DOWNLOAD_PID=""
 BACKGROUND_PROGRESS_PID=""
+BACKGROUND_PROGRESS_DASHBOARD_ACTIVE=0
 PROGRESS_STATE_DIR=""
+CURRENT_STEP_STATE_FILE=""
+BACKGROUND_PROGRESS_DISPLAY_STATE_FILE=""
 MODEL_PROGRESS_STATE_FILE=""
 MODEL_METADATA_PROGRESS_STATE_FILE=""
 UV_PROGRESS_STATE_FILE=""
@@ -46,6 +49,7 @@ APT_UPDATED=0
 CUDA_DOWNLOADS_STARTED=0
 STEP_CURRENT=0
 STEP_TOTAL=7
+CURRENT_STEP_LABEL=""
 
 log() {
     printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
@@ -64,6 +68,81 @@ format_duration() {
     fi
 }
 
+format_progress_elapsed() {
+    local state_file=$1
+    local now=$2
+    local started_at=""
+    local finished_at=""
+    local ended_at=$now
+
+    started_at="$(read_progress_started_at "$state_file")"
+    if ! [[ "$started_at" =~ ^[0-9]+$ ]] || (( started_at <= 0 )); then
+        return
+    fi
+    finished_at="$(read_progress_finished_at "$state_file")"
+    if [[ "$finished_at" =~ ^[0-9]+$ ]] && (( finished_at >= started_at )); then
+        ended_at=$finished_at
+    fi
+    if (( ended_at < started_at )); then
+        printf '0m 00s'
+        return
+    fi
+    format_duration "$((ended_at - started_at))"
+}
+
+format_combined_progress_elapsed() {
+    local now=$1
+    local first_state_file=$2
+    local second_state_file=$3
+    local first_started=""
+    local first_ended=""
+    local second_started=""
+    local second_ended=""
+    local first_duration=0
+    local second_duration=0
+    local overlap_started
+    local overlap_ended
+    local total_duration
+
+    first_started="$(read_progress_started_at "$first_state_file")"
+    second_started="$(read_progress_started_at "$second_state_file")"
+    if [[ "$first_started" =~ ^[0-9]+$ ]]; then
+        first_ended="$(read_progress_finished_at "$first_state_file")"
+        if ! [[ "$first_ended" =~ ^[0-9]+$ ]] || (( first_ended < first_started )); then
+            first_ended=$now
+        fi
+        (( first_ended >= first_started )) && first_duration=$((first_ended - first_started))
+    fi
+    if [[ "$second_started" =~ ^[0-9]+$ ]]; then
+        second_ended="$(read_progress_finished_at "$second_state_file")"
+        if ! [[ "$second_ended" =~ ^[0-9]+$ ]] || (( second_ended < second_started )); then
+            second_ended=$now
+        fi
+        (( second_ended >= second_started )) && second_duration=$((second_ended - second_started))
+    fi
+    if [[ ! "$first_started" =~ ^[0-9]+$ && ! "$second_started" =~ ^[0-9]+$ ]]; then
+        return
+    fi
+
+    total_duration=$((first_duration + second_duration))
+    if [[ "$first_started" =~ ^[0-9]+$ && "$second_started" =~ ^[0-9]+$ ]]; then
+        if (( first_started > second_started )); then
+            overlap_started=$first_started
+        else
+            overlap_started=$second_started
+        fi
+        if (( first_ended < second_ended )); then
+            overlap_ended=$first_ended
+        else
+            overlap_ended=$second_ended
+        fi
+        if (( overlap_ended > overlap_started )); then
+            total_duration=$((total_duration - overlap_ended + overlap_started))
+        fi
+    fi
+    format_duration "$total_duration"
+}
+
 step() {
     local width="${COLUMNS:-}"
     local line
@@ -72,12 +151,22 @@ step() {
     local reset=""
 
     (( STEP_CURRENT += 1 ))
+    label="STEP $STEP_CURRENT/$STEP_TOTAL | $*"
+    CURRENT_STEP_LABEL=$label
+    if [[ -n "${CURRENT_STEP_STATE_FILE:-}" ]]; then
+        write_progress_state "$CURRENT_STEP_STATE_FILE" "$CURRENT_STEP_LABEL"
+    fi
+    if (( ${BACKGROUND_PROGRESS_DASHBOARD_ACTIVE:-0} == 1 )) \
+        && [[ -n "${BACKGROUND_PROGRESS_DISPLAY_STATE_FILE:-}" ]] \
+        && [[ "$(read_progress_state "$BACKGROUND_PROGRESS_DISPLAY_STATE_FILE")" == active ]]; then
+        return 0
+    fi
+
     if ! [[ "$width" =~ ^[0-9]+$ ]] || (( width < 40 )); then
         width="$(tput cols 2>/dev/null || printf '80')"
     fi
     printf -v line '%*s' "$width" ''
     line=${line// /=}
-    label="STEP $STEP_CURRENT/$STEP_TOTAL | $*"
 
     if [[ -t 1 && "${TERM:-dumb}" != "dumb" ]]; then
         color=$'\033[1;36m'
@@ -134,10 +223,15 @@ cleanup() {
     # Restore the cursor and scroll region before emitting shutdown messages or
     # waiting on the larger download process groups.
     if [[ -n "$BACKGROUND_PROGRESS_PID" ]]; then
-        stop_process_group "$BACKGROUND_PROGRESS_PID"
-        wait "$BACKGROUND_PROGRESS_PID" 2>/dev/null || true
-        BACKGROUND_PROGRESS_PID=""
+        if declare -F finish_background_download_progress >/dev/null 2>&1; then
+            finish_background_download_progress
+        else
+            stop_process_group "$BACKGROUND_PROGRESS_PID"
+            wait "$BACKGROUND_PROGRESS_PID" 2>/dev/null || true
+            BACKGROUND_PROGRESS_PID=""
+        fi
     fi
+    BACKGROUND_PROGRESS_DASHBOARD_ACTIVE=0
 
     if [[ -n "$APP_PID" || -n "$VLLM_PID" || -n "$MODEL_DOWNLOAD_PID" \
         || -n "$UV_SYNC_PID" || -n "$CUDA_DOWNLOAD_PID" \
@@ -293,22 +387,55 @@ ensure_download_tools() {
 
 initialize_download_progress_state() {
     PROGRESS_STATE_DIR="$(mktemp -d "$ENGINE_DIR/.download-progress.XXXXXX")"
+    CURRENT_STEP_STATE_FILE="$PROGRESS_STATE_DIR/current-step"
+    BACKGROUND_PROGRESS_DISPLAY_STATE_FILE="$PROGRESS_STATE_DIR/display"
     MODEL_PROGRESS_STATE_FILE="$PROGRESS_STATE_DIR/model"
     MODEL_METADATA_PROGRESS_STATE_FILE="$PROGRESS_STATE_DIR/model-metadata"
     UV_PROGRESS_STATE_FILE="$PROGRESS_STATE_DIR/vllm"
     CUDA_PROGRESS_STATE_FILE="$PROGRESS_STATE_DIR/cuda"
     CUDNN_PROGRESS_STATE_FILE="$PROGRESS_STATE_DIR/cudnn"
     BACKGROUND_PROGRESS_STOP_FILE="$PROGRESS_STATE_DIR/stop"
+    if [[ -n "$CURRENT_STEP_LABEL" ]]; then
+        write_progress_state "$CURRENT_STEP_STATE_FILE" "$CURRENT_STEP_LABEL"
+    fi
 }
 
 write_progress_state() {
     local state_file=$1
     local state=$2
     local temporary_file
+    local previous_state=""
+    local started_file="${state_file}.started"
+    local started_temporary_file
+    local finished_file="${state_file}.finished"
+    local finished_temporary_file
 
     [[ -n "$state_file" && -d "$PROGRESS_STATE_DIR" ]] || return 0
+    if [[ -f "$state_file" ]]; then
+        IFS= read -r previous_state < "$state_file" || true
+    fi
     temporary_file="${state_file}.tmp.$$"
     printf '%s\n' "$state" > "$temporary_file"
+    case "$state" in
+        running)
+            rm -f -- "$finished_file"
+            if [[ "$previous_state" != running || ! -f "$started_file" ]]; then
+                started_temporary_file="${started_file}.tmp.$$"
+                date +%s > "$started_temporary_file"
+                mv -f -- "$started_temporary_file" "$started_file"
+            fi
+            ;;
+        complete|failed|cached|installed)
+            if [[ ! -f "$finished_file" ]]; then
+                finished_temporary_file="${finished_file}.tmp.$$"
+                date +%s > "$finished_temporary_file"
+                mv -f -- "$finished_temporary_file" "$finished_file"
+            fi
+            ;;
+        *) ;;
+    esac
+    # Publish the state last so readers never observe a terminal state before
+    # its timing sidecars are ready.
     mv -f -- "$temporary_file" "$state_file"
 }
 
@@ -322,16 +449,42 @@ read_progress_state() {
     printf '%s' "${state:-pending}"
 }
 
+read_progress_finished_at() {
+    local state_file=$1
+    local finished_at=""
+
+    if [[ -f "${state_file}.finished" ]]; then
+        IFS= read -r finished_at < "${state_file}.finished" || true
+    fi
+    [[ "$finished_at" =~ ^[0-9]+$ ]] || finished_at=""
+    printf '%s' "$finished_at"
+}
+
+read_progress_started_at() {
+    local state_file=$1
+    local started_at=""
+
+    if [[ -f "${state_file}.started" ]]; then
+        IFS= read -r started_at < "${state_file}.started" || true
+    fi
+    [[ "$started_at" =~ ^[0-9]+$ ]] || started_at=""
+    printf '%s' "$started_at"
+}
+
 remove_download_progress_state() {
     [[ -n "$PROGRESS_STATE_DIR" ]] || return 0
 
     rm -f -- \
+        "$CURRENT_STEP_STATE_FILE" \
+        "$BACKGROUND_PROGRESS_DISPLAY_STATE_FILE" \
         "$MODEL_PROGRESS_STATE_FILE" \
         "$MODEL_METADATA_PROGRESS_STATE_FILE" \
         "$UV_PROGRESS_STATE_FILE" \
         "$CUDA_PROGRESS_STATE_FILE" \
         "$CUDNN_PROGRESS_STATE_FILE" \
         "$BACKGROUND_PROGRESS_STOP_FILE" \
+        "$PROGRESS_STATE_DIR"/*.started \
+        "$PROGRESS_STATE_DIR"/*.finished \
         "$PROGRESS_STATE_DIR"/*.tmp.* 2>/dev/null || true
     rmdir -- "$PROGRESS_STATE_DIR" 2>/dev/null || true
     PROGRESS_STATE_DIR=""
@@ -379,6 +532,10 @@ start_state_tracked_background_process() {
         fi
         temporary_file="${state_file}.tmp.$$"
         printf "%s\n" "$state" > "$temporary_file"
+        finished_file="${state_file}.finished"
+        finished_temporary_file="${finished_file}.tmp.$$"
+        date +%s > "$finished_temporary_file"
+        mv -f -- "$finished_temporary_file" "$finished_file"
         mv -f -- "$temporary_file" "$state_file"
         exit "$status"
     ' setup-download "$state_file" "$@" >"$log_file" 2>&1 &
@@ -664,15 +821,15 @@ activate_background_progress_display() {
 
     BACKGROUND_PROGRESS_ROWS=$rows
     BACKGROUND_PROGRESS_COLUMNS=$columns
-    BACKGROUND_PROGRESS_FIRST_ROW=$((rows - 2))
-    BACKGROUND_PROGRESS_CONTENT_ROWS=$((rows - 3))
+    BACKGROUND_PROGRESS_FIRST_ROW=$((rows - 3))
+    BACKGROUND_PROGRESS_CONTENT_ROWS=$((rows - 4))
     BACKGROUND_PROGRESS_DISPLAY_ACTIVE=1
 
-    # Keep the final three terminal rows for the fixed progress stack. Move the
-    # shared cursor into the scrollable region so normal setup output remains
-    # above the stack instead of overwriting it.
-    printf '\033[?25l\033[1;%dr\033[%d;1H' \
+    # Pin the current step on row one and keep the final four rows for progress.
+    # Process output scrolls only through the middle region.
+    printf '\033[?25l\033[?6l\033[2;%dr\033[%d;1H' \
         "$BACKGROUND_PROGRESS_CONTENT_ROWS" "$BACKGROUND_PROGRESS_CONTENT_ROWS"
+    write_progress_state "$BACKGROUND_PROGRESS_DISPLAY_STATE_FILE" active
 }
 
 start_background_progress_display() {
@@ -680,10 +837,16 @@ start_background_progress_display() {
     local columns
 
     BACKGROUND_PROGRESS_DISPLAY_ACTIVE=0
-    [[ -t 1 && "${TERM:-dumb}" != "dumb" ]] || return 1
+    if [[ ! -t 1 || "${TERM:-dumb}" == "dumb" ]]; then
+        write_progress_state "$BACKGROUND_PROGRESS_DISPLAY_STATE_FILE" inactive
+        return 1
+    fi
 
     read -r rows columns < <(terminal_size)
-    (( rows >= 6 && columns >= 20 )) || return 1
+    if (( rows < 8 || columns < 60 )); then
+        write_progress_state "$BACKGROUND_PROGRESS_DISPLAY_STATE_FILE" inactive
+        return 1
+    fi
     activate_background_progress_display "$rows" "$columns"
 }
 
@@ -694,79 +857,281 @@ refresh_background_progress_display() {
     [[ -t 1 && "${TERM:-dumb}" != "dumb" ]] || return 0
     read -r rows columns < <(terminal_size)
 
-    if (( rows < 6 || columns < 20 )); then
-        stop_background_progress_display
+    if (( rows < 8 || columns < 60 )); then
+        write_progress_state "$BACKGROUND_PROGRESS_DISPLAY_STATE_FILE" inactive
+        stop_background_progress_display 0
         return
     fi
     if (( BACKGROUND_PROGRESS_DISPLAY_ACTIVE == 0 )); then
         activate_background_progress_display "$rows" "$columns"
     elif (( rows != BACKGROUND_PROGRESS_ROWS || columns != BACKGROUND_PROGRESS_COLUMNS )); then
-        stop_background_progress_display
+        # Keep the shared state active across a viable geometry-only redraw so
+        # step() never emits a multiline banner into the fixed-row dashboard.
+        stop_background_progress_display 0
         activate_background_progress_display "$rows" "$columns"
     fi
 }
 
-compact_download_progress() {
+compact_dashboard_progress() {
     local progress=$1
+    local duration=""
+    local replacement=""
 
-    if [[ "$progress" =~ \(([0-9]+%)\) ]]; then
-        printf '%s' "${BASH_REMATCH[1]}"
+    progress=${progress//" / "/"/"}
+    progress=${progress//" MB"/"MB"}
+    progress=${progress//" | "/" "}
+    if [[ "$progress" =~ elapsed[[:space:]]([0-9]+)h[[:space:]]([0-9]{2})m[[:space:]]([0-9]{2})s ]]; then
+        duration=${BASH_REMATCH[0]}
+        replacement="elapsed ${BASH_REMATCH[1]}:${BASH_REMATCH[2]}:${BASH_REMATCH[3]}"
+        progress=${progress/"$duration"/"$replacement"}
+    elif [[ "$progress" =~ elapsed[[:space:]]([0-9]+)m[[:space:]]([0-9]{2})s ]]; then
+        duration=${BASH_REMATCH[0]}
+        replacement="elapsed ${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
+        progress=${progress/"$duration"/"$replacement"}
+    fi
+    printf '%s' "$progress"
+}
+
+fit_dashboard_progress_row() {
+    local full_label=$1
+    local compact_label=$2
+    local progress=$3
+    local max_length=$4
+    local compact_progress
+    local percentage=""
+    local text="$full_label: $progress"
+    local available_label_length
+
+    if (( ${#text} <= max_length )); then
+        printf '%s' "$text"
         return
     fi
-    case "$progress" in
-        complete) printf '100%%' ;;
-        failed) printf 'ERR' ;;
-        ready*) printf 'ok' ;;
-        verifying) printf 'check' ;;
-        *) printf '0%%' ;;
-    esac
+
+    compact_progress="$(compact_dashboard_progress "$progress")"
+    text="$compact_label: $compact_progress"
+    if (( ${#text} <= max_length )); then
+        printf '%s' "$text"
+        return
+    fi
+    if [[ "$compact_progress" =~ [[:space:]]\([0-9]{1,3}%\) ]]; then
+        percentage=${BASH_REMATCH[0]}
+        compact_progress=${compact_progress/"$percentage"/}
+    fi
+    text="$compact_label: $compact_progress"
+    if (( ${#text} <= max_length )); then
+        printf '%s' "$text"
+        return
+    fi
+    available_label_length=$((max_length - ${#compact_progress} - 2))
+    if (( available_label_length >= 2 )); then
+        compact_label="${compact_label:0:available_label_length}"
+        if (( ${#compact_label} == available_label_length )); then
+            compact_label="${compact_label:0:available_label_length - 1}~"
+        fi
+        printf '%s: %s' "$compact_label" "$compact_progress"
+    else
+        printf '%s' "${compact_progress:0:max_length}"
+    fi
+}
+
+style_progress_marker() {
+    local text=$1
+    local marker
+    local prefix
+    local suffix
+
+    if [[ "$text" == *'[ COMPLETE ]'* ]]; then
+        marker='[ COMPLETE ]'
+        prefix=${text%%"$marker"*}
+        suffix=${text#*"$marker"}
+        text="${prefix}"$'\033[1;92m'"${marker}"$'\033[0m'"${suffix}"
+    elif [[ "$text" == *'[ FAILED ]'* ]]; then
+        marker='[ FAILED ]'
+        prefix=${text%%"$marker"*}
+        suffix=${text#*"$marker"}
+        text="${prefix}"$'\033[1;91m'"${marker}"$'\033[0m'"${suffix}"
+    fi
+    printf '%s' "$text"
 }
 
 render_background_progress() {
-    local model_text="Model ($MODEL): $1"
-    local uv_text="vLLM: $2"
-    local cuda_prefix="CUDA Toolkit $CUDA_VERSION: "
-    local cudnn_prefix=" | cuDNN $CUDNN_VERSION: "
-    local cuda_progress=$3
-    local cudnn_progress=$4
+    local step_text=$1
+    local model_progress=$2
+    local uv_progress=$3
+    local cuda_progress=$4
+    local cudnn_progress=$5
+    local model_text
+    local uv_text
     local cuda_text
+    local cudnn_text
     local max_length=$((BACKGROUND_PROGRESS_COLUMNS - 1))
-    local component_space=$((max_length - ${#cuda_prefix} - ${#cudnn_prefix}))
-    local cuda_max_length
-    local cudnn_max_length
 
     (( BACKGROUND_PROGRESS_DISPLAY_ACTIVE == 1 )) || return 0
-    if (( component_space >= 16 )); then
-        cuda_max_length=$(((component_space + 1) / 2))
-        cudnn_max_length=$((component_space - cuda_max_length))
-        cuda_text="${cuda_prefix}${cuda_progress:0:cuda_max_length}${cudnn_prefix}${cudnn_progress:0:cudnn_max_length}"
-    else
-        cuda_text="CUDA:$(compact_download_progress "$cuda_progress") cuDNN:$(compact_download_progress "$cudnn_progress")"
-    fi
-    model_text="${model_text//$'\r'/ }"
-    model_text="${model_text//$'\n'/ }"
-    uv_text="${uv_text//$'\r'/ }"
-    uv_text="${uv_text//$'\n'/ }"
-    cuda_text="${cuda_text//$'\r'/ }"
-    cuda_text="${cuda_text//$'\n'/ }"
-    model_text="${model_text:0:max_length}"
-    uv_text="${uv_text:0:max_length}"
-    cuda_text="${cuda_text:0:max_length}"
+    step_text="${step_text//$'\r'/ }"
+    step_text="${step_text//$'\n'/ }"
+    model_progress="${model_progress//$'\r'/ }"
+    model_progress="${model_progress//$'\n'/ }"
+    uv_progress="${uv_progress//$'\r'/ }"
+    uv_progress="${uv_progress//$'\n'/ }"
+    cuda_progress="${cuda_progress//$'\r'/ }"
+    cuda_progress="${cuda_progress//$'\n'/ }"
+    cudnn_progress="${cudnn_progress//$'\r'/ }"
+    cudnn_progress="${cudnn_progress//$'\n'/ }"
+    step_text="${step_text:0:max_length}"
+    model_text="$(fit_dashboard_progress_row \
+        "Model ($MODEL)" "Model (${MODEL##*/})" "$model_progress" "$max_length")"
+    uv_text="$(fit_dashboard_progress_row \
+        'vLLM' 'vLLM' "$uv_progress" "$max_length")"
+    cuda_text="$(fit_dashboard_progress_row \
+        "CUDA Toolkit $CUDA_VERSION" 'CUDA Toolkit' "$cuda_progress" "$max_length")"
+    cudnn_text="$(fit_dashboard_progress_row \
+        "cuDNN $CUDNN_VERSION" 'cuDNN' "$cudnn_progress" "$max_length")"
+    step_text=$'\033[1;36m'"${step_text}"$'\033[0m'
+    model_text="$(style_progress_marker "$model_text")"
+    uv_text="$(style_progress_marker "$uv_text")"
+    cuda_text="$(style_progress_marker "$cuda_text")"
+    cudnn_text="$(style_progress_marker "$cudnn_text")"
 
-    printf '\0337\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\0338' \
+    printf '\0337\033[1;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\0338' \
+        "$step_text" \
         "$BACKGROUND_PROGRESS_FIRST_ROW" "$model_text" \
         "$((BACKGROUND_PROGRESS_FIRST_ROW + 1))" "$uv_text" \
-        "$BACKGROUND_PROGRESS_ROWS" "$cuda_text"
+        "$((BACKGROUND_PROGRESS_FIRST_ROW + 2))" "$cuda_text" \
+        "$BACKGROUND_PROGRESS_ROWS" "$cudnn_text"
 }
 
 stop_background_progress_display() {
+    local publish_state=${1:-1}
+
     (( ${BACKGROUND_PROGRESS_DISPLAY_ACTIVE:-0} == 1 )) || return 0
 
-    printf '\0337\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[r\0338\033[?25h' \
+    printf '\033[1;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[r\033[?6l\033[%d;1H\033[?25h' \
         "$BACKGROUND_PROGRESS_FIRST_ROW" \
         "$((BACKGROUND_PROGRESS_FIRST_ROW + 1))" \
+        "$((BACKGROUND_PROGRESS_FIRST_ROW + 2))" \
+        "$BACKGROUND_PROGRESS_ROWS" \
         "$BACKGROUND_PROGRESS_ROWS"
     BACKGROUND_PROGRESS_DISPLAY_ACTIVE=0
+    if (( publish_state == 1 )); then
+        write_progress_state "$BACKGROUND_PROGRESS_DISPLAY_STATE_FILE" inactive
+    fi
+}
+
+format_transfer_metrics() {
+    local current_value=$1
+    local current_unit=$2
+    local total_value=$3
+    local total_unit=$4
+    local percent=$5
+    local rate_value=$6
+    local rate_unit=$7
+
+    LC_ALL=C awk \
+        -v current_value="$current_value" \
+        -v current_unit="$current_unit" \
+        -v total_value="$total_value" \
+        -v total_unit="$total_unit" \
+        -v percent="$percent" \
+        -v rate_value="$rate_value" \
+        -v rate_unit="$rate_unit" '
+        function unit_bytes(unit) {
+            if (unit == "B")   return 1
+            if (unit == "KB")  return 1000
+            if (unit == "MB")  return 1000000
+            if (unit == "GB")  return 1000000000
+            if (unit == "TB")  return 1000000000000
+            if (unit == "KiB") return 1024
+            if (unit == "MiB") return 1048576
+            if (unit == "GiB") return 1073741824
+            if (unit == "TiB") return 1099511627776
+            return 0
+        }
+        function display_mb(value) {
+            if (value < 10) return sprintf("%.2f", value)
+            return sprintf("%.1f", value)
+        }
+        BEGIN {
+            current_factor = unit_bytes(current_unit)
+            total_factor = unit_bytes(total_unit)
+            rate_factor = (rate_value == "" ? 1 : unit_bytes(rate_unit))
+            if (current_factor == 0 || total_factor == 0 || rate_factor == 0) exit 2
+            current_mb = current_value * current_factor / 1000000
+            total_mb = total_value * total_factor / 1000000
+            if (percent == "" && total_mb > 0) {
+                percent = int(current_mb * 100 / total_mb)
+                if (current_mb < total_mb && percent >= 100) percent = 99
+            }
+            if (percent + 0 > 100) percent = 100
+            printf "%s / %s MB", display_mb(current_mb), display_mb(total_mb)
+            if (percent != "") printf " (%d%%)", percent
+            if (rate_value != "") {
+                rate_mb = rate_value * rate_factor / 1000000
+                printf " | %s MB/s", display_mb(rate_mb)
+            }
+        }
+    '
+}
+
+normalize_download_progress() {
+    local progress_line=$1
+    local current_value=""
+    local current_unit=""
+    local total_value=""
+    local total_unit=""
+    local percent=""
+    local rate_value=""
+    local rate_unit=""
+
+    if [[ "$progress_line" =~ ([0-9]+([.][0-9]+)?)[[:space:]]*([KMGT]?i?B)[[:space:]]*/[[:space:]]*([0-9]+([.][0-9]+)?)[[:space:]]*([KMGT]?i?B) ]]; then
+        current_value=${BASH_REMATCH[1]}
+        current_unit=${BASH_REMATCH[3]}
+        total_value=${BASH_REMATCH[4]}
+        total_unit=${BASH_REMATCH[6]}
+        if [[ "$progress_line" =~ \([[:space:]]*([0-9]{1,3})%[[:space:]]*\) ]]; then
+            percent=${BASH_REMATCH[1]}
+        fi
+        if [[ "$progress_line" =~ DL:[[:space:]]*([0-9]+([.][0-9]+)?)[[:space:]]*([KMGT]?i?B) ]]; then
+            rate_value=${BASH_REMATCH[1]}
+            rate_unit=${BASH_REMATCH[3]}
+        elif [[ "$progress_line" =~ ([0-9]+([.][0-9]+)?)[[:space:]]*([KMGT]?i?B)[[:space:]]*/s ]]; then
+            rate_value=${BASH_REMATCH[1]}
+            rate_unit=${BASH_REMATCH[3]}
+        fi
+        format_transfer_metrics \
+            "$current_value" "$current_unit" "$total_value" "$total_unit" \
+            "$percent" "$rate_value" "$rate_unit" || true
+        return
+    fi
+
+    # uv announces large artifacts before its first byte-level progress update.
+    if [[ "$progress_line" =~ \(([0-9]+([.][0-9]+)?)[[:space:]]*([KMGT]?i?B)\) ]]; then
+        format_transfer_metrics 0 B "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "" "" "" || true
+    fi
+}
+
+format_progress_display() {
+    local progress=$1
+    local elapsed=$2
+    local transfer
+    local rate
+
+    case "$progress" in
+        complete) progress='[ COMPLETE ]' ;;
+        'ready (cached)') progress='[ COMPLETE ] cached' ;;
+        'ready (installed)') progress='[ COMPLETE ] installed' ;;
+        failed) progress='[ FAILED ]' ;;
+        'metadata failed') progress='[ FAILED ] metadata' ;;
+    esac
+    if [[ -n "$elapsed" ]]; then
+        if [[ "$progress" == *' | '*MB/s ]]; then
+            transfer=${progress%%' | '*}
+            rate=${progress#*' | '}
+            progress="$transfer | elapsed $elapsed | $rate"
+        else
+            progress+=" | elapsed $elapsed"
+        fi
+    fi
+    printf '%s' "$progress"
 }
 
 aria2_download_progress() {
@@ -774,9 +1139,7 @@ aria2_download_progress() {
     local process_alive=$2
     local state=$3
     local progress_line=""
-    local progress="starting"
-    local rate=""
-    local eta=""
+    local progress=""
 
     case "$state" in
         cached) printf 'ready (cached)'; return ;;
@@ -794,27 +1157,18 @@ aria2_download_progress() {
         tail -c 65536 -- "$log_file" 2>/dev/null \
             | tr '\r' '\n' \
             | sed -E $'s/\033\\[[0-9;?]*[ -/]*[@-~]//g' \
-            | grep -E '\([0-9]+%\)' \
+            | grep -E '\([[:space:]]*[0-9]{1,3}%[[:space:]]*\)' \
             | tail -n 1 \
             || true
     )"
-    if [[ "$progress_line" =~ ([^[:space:]]+/[^[:space:]]+\([0-9]+%\)) ]]; then
-        progress="${BASH_REMATCH[1]}"
-    fi
-    if [[ "$progress_line" =~ DL:([^[:space:]]+) ]]; then
-        rate="${BASH_REMATCH[1]%\]}"
-        progress+=", ${rate}/s"
-    fi
-    if [[ "$progress_line" =~ ETA:([^[:space:]]+) ]]; then
-        eta="${BASH_REMATCH[1]%\]}"
-        progress+=", ETA $eta"
-    fi
-    printf '%s' "$progress"
+    progress="$(normalize_download_progress "$progress_line")"
+    printf '%s' "${progress:-starting}"
 }
 
 uv_download_progress() {
     local process_alive=$1
     local state=$2
+    local progress_line=""
     local progress=""
 
     case "$state" in
@@ -827,24 +1181,32 @@ uv_download_progress() {
         return
     fi
 
-    progress="$(
+    progress_line="$(
         tail -c 65536 -- "$UV_SYNC_LOG" 2>/dev/null \
             | tr '\r' '\n' \
             | sed -E $'s/\033\\[[0-9;?]*[ -/]*[@-~]//g' \
-            | sed -nE '/(^|[[:space:]])(Downloading|Downloaded|Preparing|Prepared|Installed|Resolved|Audited)([[:space:]]|$)|[0-9.]+[[:space:]]*[KMGT]?i?B[[:space:]]*\/[[:space:]]*[0-9.]+/ {
-                s/^[[:space:]]+//
-                p
-            }' \
+            | grep -E '[0-9]+([.][0-9]+)?[[:space:]]*[KMGT]?i?B[[:space:]]*/[[:space:]]*[0-9]+([.][0-9]+)?[[:space:]]*[KMGT]?i?B' \
             | tail -n 1 \
             || true
     )"
+    if [[ -z "$progress_line" ]]; then
+        progress_line="$(
+            tail -c 65536 -- "$UV_SYNC_LOG" 2>/dev/null \
+                | tr '\r' '\n' \
+                | sed -E $'s/\033\\[[0-9;?]*[ -/]*[@-~]//g' \
+                | grep -E 'Downloading.*\([0-9]+([.][0-9]+)?[[:space:]]*[KMGT]?i?B\)' \
+                | tail -n 1 \
+                || true
+        )"
+    fi
+    progress="$(normalize_download_progress "$progress_line")"
     printf '%s' "${progress:-starting}"
 }
 
 model_metadata_download_progress() {
-    local progress=""
+    local progress_line=""
 
-    progress="$(
+    progress_line="$(
         tail -c 65536 -- "$MODEL_METADATA_LOG" 2>/dev/null \
             | tr '\r' '\n' \
             | sed -E $'s/\033\\[[0-9;?]*[ -/]*[@-~]//g' \
@@ -852,8 +1214,11 @@ model_metadata_download_progress() {
             | tail -n 1 \
             || true
     )"
-    progress="${progress#${progress%%[![:space:]]*}}"
-    printf '%s' "${progress:-metadata}"
+    if [[ "$progress_line" =~ ([0-9]{1,3})% ]]; then
+        printf 'metadata (%s%%)' "${BASH_REMATCH[1]}"
+    else
+        printf 'metadata'
+    fi
 }
 
 show_background_download_progress() {
@@ -870,10 +1235,16 @@ show_background_download_progress() {
     local uv_state
     local cuda_state
     local cudnn_state
+    local current_step
+    local now
     local model_progress
     local uv_progress
     local cuda_progress
     local cudnn_progress
+    local model_elapsed
+    local uv_elapsed
+    local cuda_elapsed
+    local cudnn_elapsed
 
     BACKGROUND_PROGRESS_DISPLAY_ACTIVE=0
     BACKGROUND_PROGRESS_ROWS=0
@@ -886,6 +1257,7 @@ show_background_download_progress() {
     trap 'exit 0' INT TERM HUP
 
     while [[ ! -e "$BACKGROUND_PROGRESS_STOP_FILE" ]]; do
+        now="$(date +%s)"
         model_alive=0
         uv_alive=0
         cuda_alive=0
@@ -900,24 +1272,45 @@ show_background_download_progress() {
         uv_state="$(read_progress_state "$UV_PROGRESS_STATE_FILE")"
         cuda_state="$(read_progress_state "$CUDA_PROGRESS_STATE_FILE")"
         cudnn_state="$(read_progress_state "$CUDNN_PROGRESS_STATE_FILE")"
+        current_step="$(read_progress_state "$CURRENT_STEP_STATE_FILE")"
 
         if [[ "$model_state" == failed ]]; then
             model_progress="failed"
         elif [[ "$model_metadata_state" == failed ]]; then
             model_progress="metadata failed"
-        elif (( model_alive == 1 )); then
-            model_progress="$(aria2_download_progress "$MODEL_DOWNLOAD_LOG" 1 "$model_state")"
+        elif [[ "$model_state" == running ]]; then
+            model_progress="$(aria2_download_progress "$MODEL_DOWNLOAD_LOG" "$model_alive" "$model_state")"
         elif [[ "$model_metadata_state" == running ]]; then
             model_progress="$(model_metadata_download_progress)"
+        elif [[ "$model_metadata_state" == verifying ]]; then
+            model_progress="verifying"
+        elif [[ "$model_metadata_state" == complete \
+            && ( "$model_state" == complete || "$model_state" == cached ) ]]; then
+            model_progress="complete"
+        elif [[ "$model_state" == complete ]]; then
+            model_progress="weights downloaded"
+        elif [[ "$model_state" == cached ]]; then
+            model_progress="weights cached"
         else
-            model_progress="$(aria2_download_progress "$MODEL_DOWNLOAD_LOG" 0 "$model_state")"
+            model_progress="$(aria2_download_progress "$MODEL_DOWNLOAD_LOG" "$model_alive" "$model_state")"
         fi
         uv_progress="$(uv_download_progress "$uv_alive" "$uv_state")"
         cuda_progress="$(aria2_download_progress "$CUDA_DOWNLOAD_LOG" "$cuda_alive" "$cuda_state")"
         cudnn_progress="$(aria2_download_progress "$CUDNN_DOWNLOAD_LOG" "$cudnn_alive" "$cudnn_state")"
 
+        model_elapsed="$(format_combined_progress_elapsed \
+            "$now" "$MODEL_PROGRESS_STATE_FILE" "$MODEL_METADATA_PROGRESS_STATE_FILE")"
+        uv_elapsed="$(format_progress_elapsed "$UV_PROGRESS_STATE_FILE" "$now")"
+        cuda_elapsed="$(format_progress_elapsed "$CUDA_PROGRESS_STATE_FILE" "$now")"
+        cudnn_elapsed="$(format_progress_elapsed "$CUDNN_PROGRESS_STATE_FILE" "$now")"
+        model_progress="$(format_progress_display "$model_progress" "$model_elapsed")"
+        uv_progress="$(format_progress_display "$uv_progress" "$uv_elapsed")"
+        cuda_progress="$(format_progress_display "$cuda_progress" "$cuda_elapsed")"
+        cudnn_progress="$(format_progress_display "$cudnn_progress" "$cudnn_elapsed")"
+
         refresh_background_progress_display
         render_background_progress \
+            "$current_step" \
             "$model_progress" \
             "$uv_progress" \
             "$cuda_progress" \
@@ -927,17 +1320,30 @@ show_background_download_progress() {
 }
 
 start_background_download_progress() {
+    local attempt
+    local display_state
+
     if [[ -z "$MODEL_DOWNLOAD_PID" && -z "$UV_SYNC_PID" \
         && -z "$CUDA_DOWNLOAD_PID" && -z "$CUDNN_DOWNLOAD_PID" ]]; then
         return
     fi
 
+    write_progress_state "$BACKGROUND_PROGRESS_DISPLAY_STATE_FILE" starting
     show_background_download_progress \
         "$MODEL_DOWNLOAD_PID" \
         "$UV_SYNC_PID" \
         "$CUDA_DOWNLOAD_PID" \
         "$CUDNN_DOWNLOAD_PID" &
     BACKGROUND_PROGRESS_PID=$!
+    BACKGROUND_PROGRESS_DASHBOARD_ACTIVE=1
+
+    # Avoid racing the next step banner against initial terminal activation.
+    for attempt in {1..100}; do
+        display_state="$(read_progress_state "$BACKGROUND_PROGRESS_DISPLAY_STATE_FILE")"
+        [[ "$display_state" == active || "$display_state" == inactive ]] && break
+        kill -0 "$BACKGROUND_PROGRESS_PID" 2>/dev/null || break
+        sleep 0.02
+    done
 }
 
 finish_background_download_progress() {
@@ -946,7 +1352,7 @@ finish_background_download_progress() {
         wait "$BACKGROUND_PROGRESS_PID" 2>/dev/null || true
         BACKGROUND_PROGRESS_PID=""
     fi
-    remove_download_progress_state
+    BACKGROUND_PROGRESS_DASHBOARD_ACTIVE=0
 }
 
 finish_uv_sync() {
@@ -1107,7 +1513,7 @@ finish_model_download() {
         --local-dir "$LOCAL_MODEL_DIR" \
         --exclude "$MODEL_WEIGHTS" \
         --max-workers "$HTTP_CONNECTIONS" >"$MODEL_METADATA_LOG" 2>&1; then
-        write_progress_state "$MODEL_METADATA_PROGRESS_STATE_FILE" complete
+        write_progress_state "$MODEL_METADATA_PROGRESS_STATE_FILE" verifying
         rm -f "$MODEL_METADATA_LOG"
     else
         local status=$?
@@ -1128,8 +1534,7 @@ finish_model_download() {
         die "Downloaded $MODEL_WEIGHTS is $downloaded_size bytes; expected $MODEL_WEIGHTS_SIZE bytes."
     fi
     write_progress_state "$MODEL_PROGRESS_STATE_FILE" complete
-
-    finish_background_download_progress
+    write_progress_state "$MODEL_METADATA_PROGRESS_STATE_FILE" complete
 }
 
 
