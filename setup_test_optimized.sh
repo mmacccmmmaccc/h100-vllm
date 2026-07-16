@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE_DIR="$SCRIPT_DIR/vllm_engine"
 LOCAL_MODEL_DIR="$ENGINE_DIR/models/${MODEL//\//--}"
 MODEL_DOWNLOAD_LOG="$ENGINE_DIR/.model-download.log"
-UV_SYNC_LOG="$ENGINE_DIR/.uv-sync.log"
+CUDA_INSTALL_LOG="$ENGINE_DIR/.cuda-install.log"
 VLLM_PID=""
 APP_PID=""
 MODEL_DOWNLOAD_PID=""
@@ -378,10 +378,9 @@ install_uv() {
 
 start_uv_sync() {
     log "Starting locked Python dependency synchronization in the background..."
-    rm -f "$UV_SYNC_LOG"
-    setsid bash -o pipefail -c \
-        'stdbuf -oL -eL uv sync --frozen 2>&1 | tee "$1"' \
-        _ "$UV_SYNC_LOG" &
+    # Keep uv attached directly to the terminal. Piping through tee/stdbuf makes
+    # uv detect a non-interactive stream and disables its native progress bars.
+    setsid uv sync --frozen &
     UV_SYNC_PID=$!
 }
 
@@ -391,14 +390,34 @@ finish_uv_sync() {
     log "Waiting for the background Python dependency synchronization..."
     if wait "$UV_SYNC_PID"; then
         UV_SYNC_PID=""
-        rm -f "$UV_SYNC_LOG"
         log "Python dependencies are synchronized."
     else
         local status=$?
         UV_SYNC_PID=""
-        tail -n 80 "$UV_SYNC_LOG" >&2 || true
-        die "uv sync failed with status $status; full output is in $UV_SYNC_LOG."
+        die "uv sync failed with status $status; its output was streamed above."
     fi
+}
+
+run_cuda_install_quietly() {
+    local status
+
+    rm -f "$CUDA_INSTALL_LOG"
+    set +e
+    (
+        set -Eeuo pipefail
+        install_cuda_and_cudnn
+    ) >"$CUDA_INSTALL_LOG" 2>&1
+    status=$?
+    set -e
+
+    if (( status == 0 )); then
+        rm -f "$CUDA_INSTALL_LOG"
+        return
+    fi
+
+    printf '[setup] CUDA/cuDNN installation failed; last output follows:\n' >&2
+    tail -n 80 "$CUDA_INSTALL_LOG" >&2 || true
+    die "CUDA/cuDNN installation failed with status $status; full output is in $CUDA_INSTALL_LOG."
 }
 
 configure_ngrok_repository() {
@@ -563,7 +582,7 @@ if [[ -n "${NGROK_AUTHTOKEN:-}" ]]; then
 fi
 
 step "Install or verify CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION"
-install_cuda_and_cudnn
+run_cuda_install_quietly
 export PATH="/usr/local/cuda-$CUDA_VERSION/bin:$PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda-$CUDA_VERSION/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
