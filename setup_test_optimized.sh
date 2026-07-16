@@ -16,6 +16,7 @@ MODEL_WEIGHTS_SIZE="13309692724"
 VLLM_PORT="8080"
 APP_PORT="7000"
 HTTP_CONNECTIONS="8"
+BACKGROUND_PROGRESS_INTERVAL="1"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE_DIR="$SCRIPT_DIR/vllm_engine"
@@ -26,6 +27,7 @@ VLLM_PID=""
 APP_PID=""
 MODEL_DOWNLOAD_PID=""
 UV_SYNC_PID=""
+BACKGROUND_PROGRESS_PID=""
 INSTALL_TEMP_DIR=""
 CLEANED_UP=0
 APT_UPDATED=0
@@ -116,7 +118,7 @@ cleanup() {
         INSTALL_TEMP_DIR=""
     fi
 
-    if [[ -n "$APP_PID" || -n "$VLLM_PID" || -n "$MODEL_DOWNLOAD_PID" || -n "$UV_SYNC_PID" ]]; then
+    if [[ -n "$APP_PID" || -n "$VLLM_PID" || -n "$MODEL_DOWNLOAD_PID" || -n "$UV_SYNC_PID" || -n "$BACKGROUND_PROGRESS_PID" ]]; then
         log "Stopping setup child processes..."
     fi
 
@@ -124,6 +126,7 @@ cleanup() {
     stop_process_group "$VLLM_PID"
     stop_process_group "$MODEL_DOWNLOAD_PID"
     stop_process_group "$UV_SYNC_PID"
+    stop_process_group "$BACKGROUND_PROGRESS_PID"
 
     local deadline=$((SECONDS + 15))
     while (( SECONDS < deadline )); do
@@ -131,15 +134,17 @@ cleanup() {
         local vllm_alive=0
         local model_download_alive=0
         local uv_sync_alive=0
+        local background_progress_alive=0
         process_group_is_alive "$APP_PID" && app_alive=1
         process_group_is_alive "$VLLM_PID" && vllm_alive=1
         process_group_is_alive "$MODEL_DOWNLOAD_PID" && model_download_alive=1
         process_group_is_alive "$UV_SYNC_PID" && uv_sync_alive=1
-        (( app_alive == 0 && vllm_alive == 0 && model_download_alive == 0 && uv_sync_alive == 0 )) && break
+        process_group_is_alive "$BACKGROUND_PROGRESS_PID" && background_progress_alive=1
+        (( app_alive == 0 && vllm_alive == 0 && model_download_alive == 0 && uv_sync_alive == 0 && background_progress_alive == 0 )) && break
         sleep 1
     done
 
-    for pid in "$APP_PID" "$VLLM_PID" "$MODEL_DOWNLOAD_PID" "$UV_SYNC_PID"; do
+    for pid in "$APP_PID" "$VLLM_PID" "$MODEL_DOWNLOAD_PID" "$UV_SYNC_PID" "$BACKGROUND_PROGRESS_PID"; do
         [[ -n "$pid" ]] || continue
         if process_group_is_alive "$pid"; then
             kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
@@ -383,6 +388,106 @@ start_uv_sync() {
     UV_SYNC_PID=$!
 }
 
+show_background_download_progress() {
+    local model_pid=$1
+    local uv_pid=$2
+    local model_alive
+    local uv_alive
+    local model_line
+    local model_progress
+    local model_rate
+    local model_eta
+    local progress_line
+    local previous_progress_line=""
+    local uv_downloaded
+    local uv_downloading
+    local uv_percent
+    local uv_progress
+
+    while true; do
+        model_alive=0
+        uv_alive=0
+        [[ -n "$model_pid" ]] && kill -0 "$model_pid" 2>/dev/null && model_alive=1
+        [[ -n "$uv_pid" ]] && kill -0 "$uv_pid" 2>/dev/null && uv_alive=1
+
+        model_progress="complete"
+        if (( model_alive == 1 )); then
+            model_progress="starting"
+            model_rate=""
+            model_eta=""
+            model_line="$(
+                tr '\r' '\n' < "$MODEL_DOWNLOAD_LOG" 2>/dev/null \
+                    | grep -E '\([0-9]+%\)' \
+                    | tail -n 1 \
+                    || true
+            )"
+            if [[ "$model_line" =~ ([^[:space:]]+/[^[:space:]]+\([0-9]+%\)) ]]; then
+                model_progress="${BASH_REMATCH[1]}"
+            fi
+            if [[ "$model_line" =~ DL:([^[:space:]]+) ]]; then
+                model_rate="${BASH_REMATCH[1]%\]}"
+                model_progress+=", ${model_rate}/s"
+            fi
+            if [[ "$model_line" =~ ETA:([^[:space:]]+) ]]; then
+                model_eta="${BASH_REMATCH[1]%\]}"
+                model_progress+=", ETA $model_eta"
+            fi
+        fi
+
+        uv_progress="complete"
+        if (( uv_alive == 1 )); then
+            uv_progress="starting"
+            uv_downloading="$(
+                tr '\r' '\n' < "$UV_SYNC_LOG" 2>/dev/null \
+                    | sed -E $'s/\033\\[[0-9;?]*[ -/]*[@-~]//g' \
+                    | grep -Ec '^[[:space:]]*Downloading([[:space:]]|$)' \
+                    || true
+            )"
+            uv_downloaded="$(
+                tr '\r' '\n' < "$UV_SYNC_LOG" 2>/dev/null \
+                    | sed -E $'s/\033\\[[0-9;?]*[ -/]*[@-~]//g' \
+                    | grep -Ec '^[[:space:]]*Downloaded([[:space:]]|$)' \
+                    || true
+            )"
+            uv_downloading=${uv_downloading:-0}
+            uv_downloaded=${uv_downloaded:-0}
+
+            if (( uv_downloading > 0 )); then
+                (( uv_downloaded > uv_downloading )) && uv_downloaded=$uv_downloading
+                uv_percent=$((uv_downloaded * 100 / uv_downloading))
+                uv_progress="$uv_downloaded/$uv_downloading ($uv_percent%)"
+            fi
+        fi
+
+        progress_line="$MODEL_WEIGHTS: $model_progress | Python packages: $uv_progress"
+        if [[ "$progress_line" != "$previous_progress_line" ]]; then
+            printf '[downloads] %s\n' "$progress_line"
+            previous_progress_line=$progress_line
+        fi
+
+        if (( model_alive == 0 && uv_alive == 0 )); then
+            return
+        fi
+
+        sleep "$BACKGROUND_PROGRESS_INTERVAL"
+    done
+}
+
+start_background_download_progress() {
+    if [[ -z "$MODEL_DOWNLOAD_PID" && -z "$UV_SYNC_PID" ]]; then
+        return
+    fi
+
+    show_background_download_progress "$MODEL_DOWNLOAD_PID" "$UV_SYNC_PID" &
+    BACKGROUND_PROGRESS_PID=$!
+}
+
+finish_background_download_progress() {
+    [[ -n "$BACKGROUND_PROGRESS_PID" ]] || return
+    wait "$BACKGROUND_PROGRESS_PID" 2>/dev/null || true
+    BACKGROUND_PROGRESS_PID=""
+}
+
 finish_uv_sync() {
     [[ -n "$UV_SYNC_PID" ]] || return
 
@@ -510,8 +615,8 @@ start_model_download() {
         --connect-timeout=30 \
         --timeout=60 \
         --console-log-level=warn \
-        --show-console-readout=false \
-        --summary-interval=30 \
+        --show-console-readout=true \
+        --summary-interval=1 \
         --auto-file-renaming=false \
         --allow-overwrite=true \
         --dir="$LOCAL_MODEL_DIR" \
@@ -546,7 +651,12 @@ finish_model_download() {
     downloaded_size="$(stat -c '%s' "$LOCAL_MODEL_DIR/$MODEL_WEIGHTS")"
     [[ "$downloaded_size" == "$MODEL_WEIGHTS_SIZE" ]] || \
         die "Downloaded $MODEL_WEIGHTS is $downloaded_size bytes; expected $MODEL_WEIGHTS_SIZE bytes."
+
+    finish_background_download_progress
 }
+
+
+## Running Steps ##
 
 step "Install or verify uv"
 install_uv
@@ -556,9 +666,11 @@ cd "$ENGINE_DIR"
 ensure_download_tools
 start_model_download
 start_uv_sync
+start_background_download_progress
 if [[ -n "${NGROK_AUTHTOKEN:-}" ]]; then
     configure_ngrok_repository
 fi
+
 
 step "Install or verify CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION"
 install_cuda_and_cudnn
@@ -571,11 +683,14 @@ if [[ -n "${NGROK_AUTHTOKEN:-}" ]]; then
 else
     log "ngrok is disabled because --ngrok-token was not provided."
 fi
+
 step "Install or verify FFmpeg $FFMPEG_VERSION"
 install_ffmpeg
 
+
 step "Finish locked Python dependency synchronization in $ENGINE_DIR"
 finish_uv_sync
+
 
 step "Finish downloading $MODEL over optimized HTTP"
 finish_model_download
@@ -584,6 +699,7 @@ export VLLM_BASE_URL="http://127.0.0.1:$VLLM_PORT/v1"
 export VLLM_MODEL="$MODEL"
 export APP_PORT
 export PYTHONUNBUFFERED=1
+
 
 step "Starting vLLM with $MODEL on port $VLLM_PORT"
 setsid stdbuf -oL -eL uv run vllm serve "$LOCAL_MODEL_DIR" \
