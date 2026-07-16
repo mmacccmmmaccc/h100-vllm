@@ -38,6 +38,7 @@ UV_PROGRESS_STATE_FILE=""
 CUDA_PROGRESS_STATE_FILE=""
 CUDNN_PROGRESS_STATE_FILE=""
 BACKGROUND_PROGRESS_STOP_FILE=""
+DOWNLOAD_STEP_LABEL=""
 INSTALL_TEMP_DIR=""
 CLEANED_UP=0
 APT_UPDATED=0
@@ -50,15 +51,12 @@ log() {
     printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
 }
 
-step() {
+print_step_banner() {
+    local label=$1
     local width="${COLUMNS:-}"
     local line
-    local label
     local color=""
     local reset=""
-
-    (( STEP_CURRENT += 1 ))
-    label="STEP $STEP_CURRENT/$STEP_TOTAL | $*"
 
     if ! [[ "$width" =~ ^[0-9]+$ ]] || (( width < 40 )); then
         width="$(tput cols 2>/dev/null || printf '80')"
@@ -74,6 +72,30 @@ step() {
     printf '\n%b%s%b\n' "$color" "$line" "$reset"
     printf '%b%-*s%b\n' "$color" "$width" "$label" "$reset"
     printf '%b%s%b\n' "$color" "$line" "$reset"
+}
+
+step() {
+    (( STEP_CURRENT += 1 ))
+    print_step_banner "STEP $STEP_CURRENT/$STEP_TOTAL | $*"
+}
+
+download_step() {
+    local rows
+    local columns
+
+    (( STEP_CURRENT += 1 ))
+    DOWNLOAD_STEP_LABEL="STEP $STEP_CURRENT/$STEP_TOTAL | $*"
+
+    # A capable terminal gets this label as the fixed row immediately above
+    # the four download rows. Fall back to the normal banner elsewhere.
+    if [[ ! -t 1 || "${TERM:-dumb}" == "dumb" ]]; then
+        print_step_banner "$DOWNLOAD_STEP_LABEL"
+        return
+    fi
+    read -r rows columns < <(terminal_size)
+    if (( rows < 9 || columns < 60 )); then
+        print_step_banner "$DOWNLOAD_STEP_LABEL"
+    fi
 }
 
 die() {
@@ -466,6 +488,7 @@ start_cuda_downloads() {
         return
     fi
 
+    log "Starting CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION download..."
     ensure_download_tools
     mkdir -p "$INSTALLER_CACHE_DIR"
 
@@ -659,7 +682,7 @@ install_uv() {
 }
 
 start_uv_sync() {
-    log "Starting locked Python dependency synchronization in the background..."
+    log "Starting locked Python dependency synchronization with uv..."
     # uv only emits its live download bars to a terminal. Give it a private PTY
     # while keeping every raw control sequence and process message in the log.
     start_state_tracked_background_process \
@@ -693,12 +716,13 @@ activate_background_progress_display() {
 
     BACKGROUND_PROGRESS_ROWS=$rows
     BACKGROUND_PROGRESS_COLUMNS=$columns
+    BACKGROUND_PROGRESS_HEADER_ROW=$((rows - 4))
     BACKGROUND_PROGRESS_FIRST_ROW=$((rows - 3))
-    BACKGROUND_PROGRESS_CONTENT_ROWS=$((rows - 4))
+    BACKGROUND_PROGRESS_CONTENT_ROWS=$((rows - 5))
     BACKGROUND_PROGRESS_DISPLAY_ACTIVE=1
 
-    # Keep only the final four rows fixed; process and step output share the
-    # normal scrolling region above them.
+    # Keep the step label and final four progress rows fixed. Process output
+    # continues scrolling normally in the region above this dashboard.
     printf '\033[?25l\033[?6l\033[1;%dr\033[%d;1H' \
         "$BACKGROUND_PROGRESS_CONTENT_ROWS" "$BACKGROUND_PROGRESS_CONTENT_ROWS"
 }
@@ -713,7 +737,7 @@ start_background_progress_display() {
     fi
 
     read -r rows columns < <(terminal_size)
-    if (( rows < 8 || columns < 60 )); then
+    if (( rows < 9 || columns < 60 )); then
         return 1
     fi
     activate_background_progress_display "$rows" "$columns"
@@ -726,7 +750,7 @@ refresh_background_progress_display() {
     [[ -t 1 && "${TERM:-dumb}" != "dumb" ]] || return 0
     read -r rows columns < <(terminal_size)
 
-    if (( rows < 8 || columns < 60 )); then
+    if (( rows < 9 || columns < 60 )); then
         stop_background_progress_display
         return
     fi
@@ -810,10 +834,11 @@ style_progress_marker() {
 }
 
 render_background_progress() {
-    local model_progress=$1
-    local uv_progress=$2
-    local cuda_progress=$3
-    local cudnn_progress=$4
+    local header_text=$1
+    local model_progress=$2
+    local uv_progress=$3
+    local cuda_progress=$4
+    local cudnn_progress=$5
     local model_text
     local uv_text
     local cuda_text
@@ -821,6 +846,9 @@ render_background_progress() {
     local max_length=$((BACKGROUND_PROGRESS_COLUMNS - 1))
 
     (( BACKGROUND_PROGRESS_DISPLAY_ACTIVE == 1 )) || return 0
+    header_text="${header_text//$'\r'/ }"
+    header_text="${header_text//$'\n'/ }"
+    header_text="${header_text:0:max_length}"
     model_progress="${model_progress//$'\r'/ }"
     model_progress="${model_progress//$'\n'/ }"
     uv_progress="${uv_progress//$'\r'/ }"
@@ -841,8 +869,10 @@ render_background_progress() {
     uv_text="$(style_progress_marker "$uv_text")"
     cuda_text="$(style_progress_marker "$cuda_text")"
     cudnn_text="$(style_progress_marker "$cudnn_text")"
+    header_text=$'\033[1;36m'"$header_text"$'\033[0m'
 
-    printf '\0337\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\0338' \
+    printf '\0337\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\033[%d;1H\033[2K%s\0338' \
+        "$BACKGROUND_PROGRESS_HEADER_ROW" "$header_text" \
         "$BACKGROUND_PROGRESS_FIRST_ROW" "$model_text" \
         "$((BACKGROUND_PROGRESS_FIRST_ROW + 1))" "$uv_text" \
         "$((BACKGROUND_PROGRESS_FIRST_ROW + 2))" "$cuda_text" \
@@ -852,7 +882,8 @@ render_background_progress() {
 stop_background_progress_display() {
     (( ${BACKGROUND_PROGRESS_DISPLAY_ACTIVE:-0} == 1 )) || return 0
 
-    printf '\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[r\033[?6l\033[%d;1H\033[?25h' \
+    printf '\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[%d;1H\033[2K\033[r\033[?6l\033[%d;1H\033[?25h' \
+        "$BACKGROUND_PROGRESS_HEADER_ROW" \
         "$BACKGROUND_PROGRESS_FIRST_ROW" \
         "$((BACKGROUND_PROGRESS_FIRST_ROW + 1))" \
         "$((BACKGROUND_PROGRESS_FIRST_ROW + 2))" \
@@ -1209,6 +1240,7 @@ show_background_download_progress() {
     local uv_pid=$2
     local cuda_pid=$3
     local cudnn_pid=$4
+    local download_step_label=$5
     local model_alive
     local uv_alive
     local cuda_alive
@@ -1226,6 +1258,7 @@ show_background_download_progress() {
     BACKGROUND_PROGRESS_DISPLAY_ACTIVE=0
     BACKGROUND_PROGRESS_ROWS=0
     BACKGROUND_PROGRESS_COLUMNS=0
+    BACKGROUND_PROGRESS_HEADER_ROW=0
     BACKGROUND_PROGRESS_FIRST_ROW=0
     BACKGROUND_PROGRESS_CONTENT_ROWS=0
 
@@ -1280,6 +1313,7 @@ show_background_download_progress() {
 
         refresh_background_progress_display
         render_background_progress \
+            "$download_step_label" \
             "$model_progress" \
             "$uv_progress" \
             "$cuda_progress" \
@@ -1298,7 +1332,8 @@ start_background_download_progress() {
         "$MODEL_DOWNLOAD_PID" \
         "$UV_SYNC_PID" \
         "$CUDA_DOWNLOAD_PID" \
-        "$CUDNN_DOWNLOAD_PID" &
+        "$CUDNN_DOWNLOAD_PID" \
+        "$DOWNLOAD_STEP_LABEL" &
     BACKGROUND_PROGRESS_PID=$!
 }
 
@@ -1426,7 +1461,7 @@ start_model_download() {
         return
     fi
 
-    log "Starting $MODEL_WEIGHTS download in the background with $HTTP_CONNECTIONS resumable HTTP ranges..."
+    log "Starting $MODEL_WEIGHTS download for model $MODEL..."
     start_aria2_background_download \
         "$MODEL_WEIGHTS" \
         "$model_url" \
@@ -1501,7 +1536,7 @@ step "Install or verify uv"
 install_uv
 export PATH="$HOME/.local/bin:$PATH"
 
-step "Download prerequisites"
+download_step "Download prerequisites"
 cd "$ENGINE_DIR"
 ensure_download_tools
 initialize_download_progress_state
@@ -1512,6 +1547,7 @@ start_background_download_progress
 finish_uv_sync
 finish_model_download
 finish_cuda_downloads
+finish_background_download_progress
 
 
 step "Install prerequisites"
