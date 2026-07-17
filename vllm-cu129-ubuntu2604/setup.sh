@@ -11,6 +11,12 @@ CUDA_RUNFILE_MD5="a52d6c204bd4268627dfdab8bfeeb0d1"
 CUDA_INSTALL_DIR="/usr/local/cuda-12.9"
 CUDA_HOST_GCC_MAJOR="14"
 MIN_NVIDIA_DRIVER_VERSION="575.57.08"
+LIBXML2_COMPAT_DEB="libxml2_2.9.14+dfsg-1.3ubuntu3.8_amd64.deb"
+LIBXML2_COMPAT_SHA256="bfd07c01d6e5ab3e327f3ca5819409b1914bbfb3f1a016d53e4dabd5f96143bb"
+LIBXML2_COMPAT_URL="https://security.ubuntu.com/ubuntu/pool/main/libx/libxml2/$LIBXML2_COMPAT_DEB"
+LIBICU_COMPAT_DEB="libicu74_74.2-1ubuntu3_amd64.deb"
+LIBICU_COMPAT_SHA256="d29c97a21a3e3254731cfac186e4d4e611e5e67d2c9a0430f6acfbd9acaefa2e"
+LIBICU_COMPAT_URL="https://archive.ubuntu.com/ubuntu/pool/main/i/icu/$LIBICU_COMPAT_DEB"
 FFMPEG_VERSION="7.1.5"
 HTTP_CONNECTIONS="8"
 SUDO_AUTH_DURATION_SECONDS=3600
@@ -21,6 +27,8 @@ PROJECT_DIR="$SCRIPT_DIR"
 VENV_DIR="$PROJECT_DIR/vllm-cu129-ubuntu2604"
 export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
 SUDO_KEEPALIVE_PID=""
+INSTALL_TEMP_DIR=""
+CUDA_INSTALLER_COMPAT_LIB_DIR=""
 CLEANED_UP=0
 STEP_CURRENT=0
 STEP_TOTAL=7
@@ -141,6 +149,10 @@ cleanup() {
 
     trap - EXIT INT TERM HUP
     stop_sudo_authorization
+    if [[ -n "$INSTALL_TEMP_DIR" ]]; then
+        rm -rf "$INSTALL_TEMP_DIR"
+        INSTALL_TEMP_DIR=""
+    fi
     exit "$status"
 }
 
@@ -188,6 +200,16 @@ ensure_download_tools() {
     fi
 }
 
+file_matches_sha256() {
+    local file_path=$1
+    local expected_sha256=$2
+    local checksum_line=""
+
+    [[ -f "$file_path" ]] || return 1
+    checksum_line="$(sha256sum "$file_path")"
+    [[ "${checksum_line%% *}" == "$expected_sha256" ]]
+}
+
 verify_nvidia_driver() {
     local driver_version=""
 
@@ -211,16 +233,74 @@ install_cuda_host_compiler() {
     local gcc_path="/usr/bin/gcc-$CUDA_HOST_GCC_MAJOR"
     local gxx_path="/usr/bin/g++-$CUDA_HOST_GCC_MAJOR"
 
-    if [[ ! -x "$gcc_path" || ! -x "$gxx_path" ]]; then
-        log "Installing GCC $CUDA_HOST_GCC_MAJOR for CUDA $CUDA_VERSION host compilation..."
+    if [[ ! -x "$gcc_path" || ! -x "$gxx_path" || ! -x /usr/bin/gnudd ]]; then
+        log "Installing GCC $CUDA_HOST_GCC_MAJOR and GNU coreutils for CUDA $CUDA_VERSION..."
         as_root apt-get update
-        apt_install "gcc-$CUDA_HOST_GCC_MAJOR" "g++-$CUDA_HOST_GCC_MAJOR"
+        apt_install "gcc-$CUDA_HOST_GCC_MAJOR" "g++-$CUDA_HOST_GCC_MAJOR" gnu-coreutils
     fi
 
     [[ -x "$gcc_path" && -x "$gxx_path" ]] \
         || die "GCC $CUDA_HOST_GCC_MAJOR installation failed; CUDA $CUDA_VERSION does not support Ubuntu 26.04's default GCC 15."
+    [[ -x /usr/bin/gnudd ]] \
+        || die "GNU dd was not found at /usr/bin/gnudd; it is required for reliable CUDA runfile extraction on Ubuntu 26.04."
 
     log "Using $($gcc_path -dumpfullversion -dumpversion) as the CUDA host compiler."
+    log "Using /usr/bin/gnudd for NVIDIA runfile extraction on Ubuntu 26.04."
+}
+
+prepare_cuda_installer_compat_libraries() {
+    local compat_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/h100-vllm/cu129/installers/ubuntu2404-libxml2-compat"
+    local package_cache_dir="$compat_cache_dir/packages"
+    local extract_dir="$compat_cache_dir/root"
+    local lib_dir="$extract_dir/usr/lib/x86_64-linux-gnu"
+    local package_path=""
+
+    if [[ -e "$lib_dir/libxml2.so.2" \
+        && -e "$lib_dir/libicuuc.so.74" \
+        && -e "$lib_dir/libicudata.so.74" ]]; then
+        CUDA_INSTALLER_COMPAT_LIB_DIR="$lib_dir"
+        log "Reusing the private libxml2.so.2 compatibility bundle at $lib_dir."
+        return
+    fi
+
+    ensure_download_tools
+    mkdir -p "$package_cache_dir"
+
+    package_path="$package_cache_dir/$LIBXML2_COMPAT_DEB"
+    if ! file_matches_sha256 "$package_path" "$LIBXML2_COMPAT_SHA256"; then
+        rm -f "$package_path"
+        log "Downloading Ubuntu 24.04 libxml2.so.2 compatibility package..."
+        curl --fail --location --retry 5 --output "$package_path" "$LIBXML2_COMPAT_URL"
+    fi
+    file_matches_sha256 "$package_path" "$LIBXML2_COMPAT_SHA256" \
+        || die "Checksum verification failed for $LIBXML2_COMPAT_DEB."
+
+    package_path="$package_cache_dir/$LIBICU_COMPAT_DEB"
+    if ! file_matches_sha256 "$package_path" "$LIBICU_COMPAT_SHA256"; then
+        rm -f "$package_path"
+        log "Downloading Ubuntu 24.04 ICU 74 compatibility package..."
+        curl --fail --location --retry 5 --output "$package_path" "$LIBICU_COMPAT_URL"
+    fi
+    file_matches_sha256 "$package_path" "$LIBICU_COMPAT_SHA256" \
+        || die "Checksum verification failed for $LIBICU_COMPAT_DEB."
+
+    rm -rf "$extract_dir"
+    mkdir -p "$extract_dir"
+    dpkg-deb --extract "$package_cache_dir/$LIBXML2_COMPAT_DEB" "$extract_dir"
+    dpkg-deb --extract "$package_cache_dir/$LIBICU_COMPAT_DEB" "$extract_dir"
+
+    [[ -e "$lib_dir/libxml2.so.2" \
+        && -e "$lib_dir/libicuuc.so.74" \
+        && -e "$lib_dir/libicudata.so.74" ]] \
+        || die "The private CUDA installer compatibility bundle is incomplete."
+
+    if LD_LIBRARY_PATH="$lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        ldd "$lib_dir/libxml2.so.2" | grep -q 'not found'; then
+        die "The private libxml2.so.2 compatibility bundle has unresolved dependencies."
+    fi
+
+    CUDA_INSTALLER_COMPAT_LIB_DIR="$lib_dir"
+    log "Prepared private libxml2.so.2 compatibility libraries for the CUDA installer."
 }
 
 install_cuda_toolkit() {
@@ -274,12 +354,25 @@ install_cuda_toolkit() {
         die "CUDA runfile checksum mismatch: expected $CUDA_RUNFILE_MD5, got $actual_md5."
     fi
 
+    prepare_cuda_installer_compat_libraries
+
     log "Installing CUDA Toolkit $CUDA_VERSION at $CUDA_INSTALL_DIR without installing an NVIDIA driver..."
-    as_root sh "$runfile_path" \
+    INSTALL_TEMP_DIR="$(mktemp -d)"
+    ln -s /usr/bin/gnudd "$INSTALL_TEMP_DIR/dd"
+    if ! as_root env \
+        PATH="$INSTALL_TEMP_DIR:$PATH" \
+        LD_LIBRARY_PATH="$CUDA_INSTALLER_COMPAT_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        sh "$runfile_path" \
         --silent \
         --toolkit \
         --toolkitpath="$CUDA_INSTALL_DIR" \
-        --override
+        --override; then
+        rm -rf "$INSTALL_TEMP_DIR"
+        INSTALL_TEMP_DIR=""
+        die "CUDA runfile installation failed. Check /var/log/cuda-installer.log for details."
+    fi
+    rm -rf "$INSTALL_TEMP_DIR"
+    INSTALL_TEMP_DIR=""
 
     [[ -x "$CUDA_INSTALL_DIR/bin/nvcc" ]] \
         || die "CUDA installation completed, but $CUDA_INSTALL_DIR/bin/nvcc was not found."

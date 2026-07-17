@@ -4,6 +4,8 @@ This context installs CUDA Toolkit 12.9 Update 1 and runs the locked CUDA 12.9 b
 
 NVIDIA does not officially qualify Ubuntu 26.04 for CUDA 12.9. The setup therefore uses NVIDIA's standalone 12.9.1 runfile in silent, toolkit-only override mode. It never installs or replaces the NVIDIA driver. The download is verified against NVIDIA's published MD5 checksum before execution and removed after successful installation.
 
+Ubuntu 26.04 ships Rust coreutils and `libxml2.so.16`, while the older NVIDIA runfile installer expects GNU `dd` behavior and `libxml2.so.2`. The setup installs `gnu-coreutils`, temporarily exposes `/usr/bin/gnudd` as `dd`, and extracts checksum-verified Ubuntu 24.04 `libxml2.so.2` and ICU 74 packages into a private cache used only while the CUDA installer runs. It does not replace or modify Ubuntu 26.04's system libraries.
+
 Ubuntu 26.04 defaults to GCC 15, while CUDA 12.9 supports GCC through version 14. The setup installs `gcc-14` and `g++-14` and exports them as the CUDA host compilers. System cuDNN is not installed; the frozen Python lock supplies the CUDA 12.9 and cuDNN runtime libraries required by the cu129 wheels.
 
 Requirements:
@@ -20,6 +22,6 @@ Run:
 ./setup.sh
 ```
 
-The setup verifies the NVIDIA driver, installs GCC 14 and CUDA Toolkit 12.9 at `/usr/local/cuda-12.9`, installs uv, FFmpeg 7, and libsndfile, synchronizes the frozen dependency lock, authenticates with Hugging Face, and opens a shell with the environment activated. It exports `CUDA_HOME`, compiler variables, `PATH`, `LD_LIBRARY_PATH`, and `VLLM_WSL2_ENABLE_PIN_MEMORY=1`.
+The setup verifies the NVIDIA driver, installs GCC 14, GNU coreutils, and CUDA Toolkit 12.9 at `/usr/local/cuda-12.9`, installs uv, FFmpeg 7, and libsndfile, synchronizes the frozen dependency lock, authenticates with Hugging Face, and opens a shell with the environment activated. It exports `CUDA_HOME`, compiler variables, `PATH`, `LD_LIBRARY_PATH`, and `VLLM_WSL2_ENABLE_PIN_MEMORY=1`.
 
 Because Ubuntu 26.04 is not an NVIDIA-qualified CUDA 12.9 platform, use Ubuntu 24.04 or a supported container if an extension remains incompatible with the newer operating-system libraries.
