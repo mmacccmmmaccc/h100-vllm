@@ -4,12 +4,17 @@ set -Eeuo pipefail
 
 SETUP_START_SECONDS=$SECONDS
 
-CUDA_VERSION="13.0"
-CUDA_RELEASE="13.0.2"
-CUDA_RUNFILE="cuda_13.0.2_580.95.05_linux.run"
-CUDA_RUNFILE_MD5="3f092554675f004250d4dfc1d6c3acc9"
-CUDA_INSTALL_DIR="/usr/local/cuda-13.0"
-MIN_NVIDIA_DRIVER_VERSION="580.95.05"
+CUDA_VERSION="13.3"
+CUDA_MIN_VERSION="13.3"
+CUDA_RELEASE="13.3.1"
+CUDA_LOCAL_REPO_VERSION="13.3.1-610.43.02-1"
+ACTIVE_CUDA_VERSION=""
+ACTIVE_CUDA_HOME=""
+CUDNN_VERSION="9.24.0"
+CUDNN_MIN_VERSION="9.24.0"
+CUDNN_PACKAGE_VERSION="9.24.0.43-1"
+ACTIVE_CUDNN_VERSION=""
+ACTIVE_CUDNN_PACKAGE=""
 FFMPEG_VERSION="7.1.5"
 HTTP_CONNECTIONS="8"
 SUDO_AUTH_DURATION_SECONDS=3600
@@ -18,12 +23,11 @@ SUDO_REFRESH_INTERVAL_SECONDS=50
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
 VENV_DIR="$PROJECT_DIR/vllm-cu130-ubuntu2604"
-export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
-SUDO_KEEPALIVE_PID=""
 INSTALL_TEMP_DIR=""
+SUDO_KEEPALIVE_PID=""
 CLEANED_UP=0
 STEP_CURRENT=0
-STEP_TOTAL=7
+STEP_TOTAL=6
 
 log() {
     printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
@@ -145,6 +149,7 @@ cleanup() {
         rm -rf "$INSTALL_TEMP_DIR"
         INSTALL_TEMP_DIR=""
     fi
+
     exit "$status"
 }
 
@@ -166,6 +171,7 @@ trap 'handle_signal HUP 129' HUP
 # Keep future Hugging Face CLI/model usage on the regular HTTP path.
 export HF_HUB_DISABLE_XET=1
 export VLLM_WSL2_ENABLE_PIN_MEMORY=1
+export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
 unset HF_XET_NUM_CONCURRENT_RANGE_GETS
 unset HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY
 
@@ -177,10 +183,12 @@ command -v apt-get >/dev/null 2>&1 || die "apt-get was not found."
 [[ -f "$PROJECT_DIR/pyproject.toml" ]] || die "Missing $PROJECT_DIR/pyproject.toml."
 [[ -f "$PROJECT_DIR/uv.lock" ]] || die "Missing $PROJECT_DIR/uv.lock."
 
-[[ "${VERSION_ID:-}" == "26.04" ]] \
-    || die "This CUDA 13.0 runfile context requires Ubuntu 26.04; found ${VERSION_ID:-unknown}."
+case "${VERSION_ID:-}" in
+    26.04) CUDA_REPO_DISTRO="ubuntu2604" ;;
+    *) die "This CUDA 13.3 context requires Ubuntu 26.04; found ${VERSION_ID:-unknown}." ;;
+esac
 
-[[ "$(uname -m)" == "x86_64" ]] || die "This setup currently supports x86_64 only."
+[[ "$(uname -m)" == "x86_64" ]] || die "This CUDA installer currently supports x86_64 only."
 
 ensure_download_tools() {
     if ! command -v curl >/dev/null 2>&1 \
@@ -192,130 +200,198 @@ ensure_download_tools() {
     fi
 }
 
-verify_nvidia_driver() {
-    local driver_version=""
+detect_compatible_cuda_toolkit() {
+    local nvcc_path=""
+    local nvcc_real_path=""
+    local nvcc_version=""
+    local -a nvcc_candidates=()
 
-    command -v nvidia-smi >/dev/null 2>&1 \
-        || die "nvidia-smi was not found. Install an NVIDIA driver that supports CUDA 12.9, then retry."
+    if command -v nvcc >/dev/null 2>&1; then
+        nvcc_candidates+=("$(command -v nvcc)")
+    fi
+    [[ -x /usr/local/cuda/bin/nvcc ]] && nvcc_candidates+=(/usr/local/cuda/bin/nvcc)
+    [[ -x "/usr/local/cuda-$CUDA_VERSION/bin/nvcc" ]] \
+        && nvcc_candidates+=("/usr/local/cuda-$CUDA_VERSION/bin/nvcc")
 
-    driver_version="$(
-        nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null \
-            | head -n1 \
-            | tr -d '[:space:]'
-    )"
-    [[ -n "$driver_version" ]] || die "nvidia-smi could not report an NVIDIA driver version."
+    shopt -s nullglob
+    nvcc_candidates+=(/usr/local/cuda-13*/bin/nvcc)
+    shopt -u nullglob
 
-    dpkg --compare-versions "$driver_version" ge "$MIN_NVIDIA_DRIVER_VERSION" \
-        || die "NVIDIA driver $driver_version is too old; CUDA 12.9 requires driver $MIN_NVIDIA_DRIVER_VERSION or newer."
+    for nvcc_path in "${nvcc_candidates[@]}"; do
+        [[ -x "$nvcc_path" ]] || continue
+        nvcc_version="$("$nvcc_path" --version | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+        if ! dpkg --compare-versions "$nvcc_version" ge "$CUDA_MIN_VERSION" \
+            || ! dpkg --compare-versions "$nvcc_version" lt 14; then
+            continue
+        fi
 
-    log "NVIDIA driver $driver_version supports CUDA Toolkit $CUDA_VERSION and the locked cu130 packages."
+        nvcc_real_path="$(readlink -f -- "$nvcc_path")"
+        ACTIVE_CUDA_VERSION="$nvcc_version"
+        ACTIVE_CUDA_HOME="$(cd -- "$(dirname -- "$nvcc_real_path")/.." && pwd -P)"
+        return 0
+    done
+
+    ACTIVE_CUDA_VERSION=""
+    ACTIVE_CUDA_HOME=""
+    return 1
 }
 
-install_cuda_prerequisites() {
-    local gcc_major=""
+detect_compatible_cudnn() {
+    local package_name=""
+    local package_version=""
+    local upstream_version=""
 
-    if ! command -v gcc >/dev/null 2>&1 \
-        || ! command -v g++ >/dev/null 2>&1 \
-        || [[ ! -x /usr/bin/gnudd ]]; then
-        log "Installing CUDA host compiler and GNU coreutils prerequisites..."
-        as_root apt-get update
-        apt_install build-essential gnu-coreutils
-    fi
+    for package_name in cudnn9-cuda-13 libcudnn9-cuda-13; do
+        package_version="$(dpkg-query -W -f='${Version}' "$package_name" 2>/dev/null || true)"
+        [[ -n "$package_version" ]] || continue
 
-    command -v gcc >/dev/null 2>&1 && command -v g++ >/dev/null 2>&1 \
-        || die "A GCC/G++ host compiler is required for CUDA $CUDA_VERSION."
-    [[ -x /usr/bin/gnudd ]] \
-        || die "GNU dd was not found at /usr/bin/gnudd; it is required for reliable CUDA runfile extraction on Ubuntu 26.04."
+        # Ignore an optional Debian epoch when comparing the upstream version.
+        upstream_version="${package_version#*:}"
+        if dpkg --compare-versions "$upstream_version" ge "$CUDNN_MIN_VERSION" \
+            && dpkg --compare-versions "$upstream_version" lt 10; then
+            ACTIVE_CUDNN_VERSION="$package_version"
+            ACTIVE_CUDNN_PACKAGE="$package_name"
+            return 0
+        fi
+    done
 
-    gcc_major="$(gcc -dumpfullversion -dumpversion | cut -d. -f1)"
-    [[ "$gcc_major" =~ ^[0-9]+$ ]] \
-        || die "Could not determine the installed GCC major version."
-    (( gcc_major >= 6 && gcc_major <= 15 )) \
-        || die "CUDA $CUDA_VERSION supports GCC 6 through 15; found $(gcc -dumpfullversion -dumpversion)."
-
-    log "Using GCC $(gcc -dumpfullversion -dumpversion) as the CUDA host compiler."
-    log "Using /usr/bin/gnudd for NVIDIA runfile extraction on Ubuntu 26.04."
+    ACTIVE_CUDNN_VERSION=""
+    ACTIVE_CUDNN_PACKAGE=""
+    return 1
 }
 
-install_cuda_toolkit() {
-    local installed_version=""
-    local installer_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/h100-vllm/cu130/installers"
-    local runfile_path="$installer_cache_dir/$CUDA_RUNFILE"
-    local runfile_url="https://developer.download.nvidia.com/compute/cuda/$CUDA_RELEASE/local_installers/$CUDA_RUNFILE"
-    local actual_md5=""
-
-    if [[ -x "$CUDA_INSTALL_DIR/bin/nvcc" ]]; then
-        installed_version="$(
-            "$CUDA_INSTALL_DIR/bin/nvcc" --version \
-                | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' \
-                | head -n1
-        )"
+install_cuda_and_cudnn() {
+    local cuda_installed=0
+    if detect_compatible_cuda_toolkit; then
+        cuda_installed=1
     fi
 
-    if [[ "$installed_version" == "$CUDA_VERSION" ]]; then
-        log "CUDA Toolkit $CUDA_VERSION is already installed at $CUDA_INSTALL_DIR."
+    local cudnn_installed=0
+    if detect_compatible_cudnn; then
+        cudnn_installed=1
+    fi
+
+    if (( cuda_installed == 1 && cudnn_installed == 1 )); then
+        log "Compatible CUDA Toolkit $ACTIVE_CUDA_VERSION and cuDNN $ACTIVE_CUDNN_VERSION are already installed."
         return
     fi
 
     ensure_download_tools
+    if (( cuda_installed == 0 )); then
+        log "No supported CUDA >=$CUDA_MIN_VERSION,<14 toolkit was detected; installing CUDA Toolkit $CUDA_RELEASE."
+    else
+        log "Using detected CUDA Toolkit $ACTIVE_CUDA_VERSION at $ACTIVE_CUDA_HOME."
+    fi
+    if (( cudnn_installed == 0 )); then
+        log "No supported cuDNN >=$CUDNN_MIN_VERSION,<10 was detected; installing cuDNN $CUDNN_VERSION."
+    else
+        log "Using detected cuDNN $ACTIVE_CUDNN_VERSION from $ACTIVE_CUDNN_PACKAGE."
+    fi
+
+    local repo_name="cuda-repo-${CUDA_REPO_DISTRO}-13-3-local"
+    local repo_deb="${repo_name}_${CUDA_LOCAL_REPO_VERSION}_amd64.deb"
+    local cudnn_repo_name="cudnn-local-repo-${CUDA_REPO_DISTRO}-${CUDNN_VERSION}"
+    local cudnn_repo_deb="${cudnn_repo_name}_1.0-1_amd64.deb"
+    local download_dir
+    local installer_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/h100-vllm/vllm-cu130-ubuntu2604/installers"
+    local keyring
+    local -a packages=()
+    local -a repo_packages=()
+    download_dir="$(mktemp -d)"
+    INSTALL_TEMP_DIR="$download_dir"
     mkdir -p "$installer_cache_dir"
 
-    log "CUDA $CUDA_RELEASE does not officially qualify Ubuntu 26.04; using NVIDIA's standalone toolkit runfile with override mode."
-    log "Downloading $CUDA_RUNFILE (the download can resume if interrupted)..."
-    aria2c \
-        -x "$HTTP_CONNECTIONS" \
-        -s "$HTTP_CONNECTIONS" \
-        -k 1M \
-        -c \
-        --file-allocation=falloc \
-        --disk-cache=64M \
-        --max-tries=10 \
-        --retry-wait=3 \
-        --connect-timeout=30 \
-        --timeout=60 \
-        --console-log-level=warn \
-        --show-console-readout=true \
-        --summary-interval=0 \
-        --auto-file-renaming=false \
-        --allow-overwrite=true \
-        --dir="$installer_cache_dir" \
-        --out="$CUDA_RUNFILE" \
-        "$runfile_url"
+    if (( cuda_installed == 0 )); then
+        wget -qO "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
+            "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_REPO_DISTRO}/x86_64/cuda-${CUDA_REPO_DISTRO}.pin"
+        as_root install -m 644 \
+            "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
+            /etc/apt/preferences.d/cuda-repository-pin-600
 
-    actual_md5="$(md5sum "$runfile_path" | awk '{print $1}')"
-    if [[ "$actual_md5" != "$CUDA_RUNFILE_MD5" ]]; then
-        rm -f "$runfile_path" "${runfile_path}.aria2"
-        die "CUDA runfile checksum mismatch: expected $CUDA_RUNFILE_MD5, got $actual_md5."
+        if dpkg-query -W -f='${Status}' "$repo_name" 2>/dev/null | grep -q 'ok installed' \
+            && [[ -d "/var/$repo_name" ]]; then
+            log "Reusing the existing CUDA local repository in /var/$repo_name."
+        else
+            aria2c \
+                -x "$HTTP_CONNECTIONS" \
+                -s "$HTTP_CONNECTIONS" \
+                -k 1M \
+                -c \
+                --file-allocation=falloc \
+                --disk-cache=64M \
+                --max-tries=10 \
+                --retry-wait=3 \
+                --connect-timeout=30 \
+                --timeout=60 \
+                --console-log-level=warn \
+                --show-console-readout=true \
+                --summary-interval=0 \
+                --auto-file-renaming=false \
+                --allow-overwrite=true \
+                --dir="$installer_cache_dir" \
+                --out="$repo_deb" \
+                "https://developer.download.nvidia.com/compute/cuda/${CUDA_RELEASE}/local_installers/${repo_deb}"
+            as_root dpkg -i "$installer_cache_dir/$repo_deb"
+            rm -f "$installer_cache_dir/$repo_deb" "$installer_cache_dir/${repo_deb}.aria2"
+        fi
+
+        keyring="$(find "/var/$repo_name" -maxdepth 1 -type f -name 'cuda-*-keyring.gpg' -print -quit)"
+        [[ -n "$keyring" ]] || die "CUDA local repository keyring was not found in /var/$repo_name."
+        as_root cp "$keyring" /usr/share/keyrings/
+        packages+=("cuda-toolkit-13-3")
+        repo_packages+=("$repo_name")
     fi
 
-    log "Installing CUDA Toolkit $CUDA_VERSION at $CUDA_INSTALL_DIR without installing an NVIDIA driver..."
-    INSTALL_TEMP_DIR="$(mktemp -d)"
-    ln -s /usr/bin/gnudd "$INSTALL_TEMP_DIR/dd"
-    if ! as_root env PATH="$INSTALL_TEMP_DIR:$PATH" sh "$runfile_path" \
-        --silent \
-        --toolkit \
-        --toolkitpath="$CUDA_INSTALL_DIR" \
-        --override; then
-        rm -rf "$INSTALL_TEMP_DIR"
-        INSTALL_TEMP_DIR=""
-        die "CUDA runfile installation failed. Check /var/log/cuda-installer.log for details."
+    if (( cudnn_installed == 0 )); then
+        if dpkg-query -W -f='${Status}' "$cudnn_repo_name" 2>/dev/null | grep -q 'ok installed' \
+            && [[ -d "/var/$cudnn_repo_name" ]]; then
+            log "Reusing the existing cuDNN local repository in /var/$cudnn_repo_name."
+        else
+            aria2c \
+                -x "$HTTP_CONNECTIONS" \
+                -s "$HTTP_CONNECTIONS" \
+                -k 1M \
+                -c \
+                --file-allocation=falloc \
+                --disk-cache=64M \
+                --max-tries=10 \
+                --retry-wait=3 \
+                --connect-timeout=30 \
+                --timeout=60 \
+                --console-log-level=warn \
+                --show-console-readout=true \
+                --summary-interval=0 \
+                --auto-file-renaming=false \
+                --allow-overwrite=true \
+                --dir="$installer_cache_dir" \
+                --out="$cudnn_repo_deb" \
+                "https://developer.download.nvidia.com/compute/cudnn/${CUDNN_VERSION}/local_installers/${cudnn_repo_deb}"
+            as_root dpkg -i "$installer_cache_dir/$cudnn_repo_deb"
+            rm -f "$installer_cache_dir/$cudnn_repo_deb" "$installer_cache_dir/${cudnn_repo_deb}.aria2"
+        fi
+
+        keyring="$(find "/var/$cudnn_repo_name" -maxdepth 1 -type f -name 'cudnn-*-keyring.gpg' -print -quit)"
+        [[ -n "$keyring" ]] || die "cuDNN local repository keyring was not found in /var/$cudnn_repo_name."
+        as_root cp "$keyring" /usr/share/keyrings/
+        packages+=("cudnn9-cuda-13=$CUDNN_PACKAGE_VERSION")
+        repo_packages+=("$cudnn_repo_name")
     fi
-    rm -rf "$INSTALL_TEMP_DIR"
+
+    as_root apt-get update
+    apt_install "${packages[@]}"
+
+    as_root env DEBIAN_FRONTEND=noninteractive apt-get remove -y --purge \
+        "${repo_packages[@]}"
+    if (( cuda_installed == 0 )); then
+        as_root rm -f /etc/apt/preferences.d/cuda-repository-pin-600
+    fi
+    rm -rf "$download_dir"
     INSTALL_TEMP_DIR=""
 
-    [[ -x "$CUDA_INSTALL_DIR/bin/nvcc" ]] \
-        || die "CUDA installation completed, but $CUDA_INSTALL_DIR/bin/nvcc was not found."
-
-    installed_version="$(
-        "$CUDA_INSTALL_DIR/bin/nvcc" --version \
-            | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' \
-            | head -n1
-    )"
-    [[ "$installed_version" == "$CUDA_VERSION" ]] \
-        || die "Expected CUDA $CUDA_VERSION after installation, but nvcc reported ${installed_version:-unknown}."
-
-    rm -f "$runfile_path" "${runfile_path}.aria2"
-    log "CUDA Toolkit $CUDA_VERSION installed successfully; the downloaded runfile was removed."
+    detect_compatible_cuda_toolkit \
+        || die "CUDA installation completed, but a supported CUDA >=$CUDA_MIN_VERSION,<14 nvcc was not found."
+    detect_compatible_cudnn \
+        || die "cuDNN installation completed, but a supported cuDNN >=$CUDNN_MIN_VERSION,<10 was not found."
 }
 
 install_uv() {
@@ -408,19 +484,11 @@ install_ffmpeg() {
 
 authorize_sudo_for_60_minutes
 
-step "Verify NVIDIA driver compatibility with CUDA $CUDA_VERSION"
-verify_nvidia_driver
-
-step "Install or verify prerequisites and CUDA Toolkit $CUDA_VERSION from the NVIDIA runfile"
-install_cuda_prerequisites
-install_cuda_toolkit
-export CUDA_HOME="$CUDA_INSTALL_DIR"
-export CC="$(command -v gcc)"
-export CXX="$(command -v g++)"
-export CUDAHOSTCXX="$CXX"
-export NVCC_CCBIN="$CXX"
-export PATH="$CUDA_HOME/bin:$HOME/.local/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+step "Install or verify CUDA Toolkit >=$CUDA_MIN_VERSION,<14 and cuDNN >=$CUDNN_MIN_VERSION,<10"
+install_cuda_and_cudnn
+export CUDA_HOME="$ACTIVE_CUDA_HOME"
+export PATH="$ACTIVE_CUDA_HOME/bin:$HOME/.local/bin:$PATH"
+export LD_LIBRARY_PATH="$ACTIVE_CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 step "Install or verify uv"
 install_uv

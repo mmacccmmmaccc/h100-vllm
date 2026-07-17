@@ -4,8 +4,15 @@ set -Eeuo pipefail
 
 SETUP_START_SECONDS=$SECONDS
 
+CUDA_VERSION="12.9"
+CUDA_RELEASE="12.9.1"
+CUDA_RUNFILE="cuda_12.9.1_575.57.08_linux.run"
+CUDA_RUNFILE_MD5="a52d6c204bd4268627dfdab8bfeeb0d1"
+CUDA_INSTALL_DIR="/usr/local/cuda-12.9"
+CUDA_HOST_GCC_MAJOR="14"
 MIN_NVIDIA_DRIVER_VERSION="575.57.08"
 FFMPEG_VERSION="7.1.5"
+HTTP_CONNECTIONS="8"
 SUDO_AUTH_DURATION_SECONDS=3600
 SUDO_REFRESH_INTERVAL_SECONDS=50
 
@@ -16,7 +23,7 @@ export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
 SUDO_KEEPALIVE_PID=""
 CLEANED_UP=0
 STEP_CURRENT=0
-STEP_TOTAL=6
+STEP_TOTAL=7
 
 log() {
     printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
@@ -197,8 +204,96 @@ verify_nvidia_driver() {
     dpkg --compare-versions "$driver_version" ge "$MIN_NVIDIA_DRIVER_VERSION" \
         || die "NVIDIA driver $driver_version is too old; CUDA 12.9 requires driver $MIN_NVIDIA_DRIVER_VERSION or newer."
 
-    log "NVIDIA driver $driver_version supports the locked CUDA 12.9 runtime wheels."
-    log "No system CUDA Toolkit or cuDNN installation is required for this binary-runtime context."
+    log "NVIDIA driver $driver_version supports CUDA Toolkit $CUDA_VERSION and the locked cu129 wheels."
+}
+
+install_cuda_host_compiler() {
+    local gcc_path="/usr/bin/gcc-$CUDA_HOST_GCC_MAJOR"
+    local gxx_path="/usr/bin/g++-$CUDA_HOST_GCC_MAJOR"
+
+    if [[ ! -x "$gcc_path" || ! -x "$gxx_path" ]]; then
+        log "Installing GCC $CUDA_HOST_GCC_MAJOR for CUDA $CUDA_VERSION host compilation..."
+        as_root apt-get update
+        apt_install "gcc-$CUDA_HOST_GCC_MAJOR" "g++-$CUDA_HOST_GCC_MAJOR"
+    fi
+
+    [[ -x "$gcc_path" && -x "$gxx_path" ]] \
+        || die "GCC $CUDA_HOST_GCC_MAJOR installation failed; CUDA $CUDA_VERSION does not support Ubuntu 26.04's default GCC 15."
+
+    log "Using $($gcc_path -dumpfullversion -dumpversion) as the CUDA host compiler."
+}
+
+install_cuda_toolkit() {
+    local installed_version=""
+    local installer_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/h100-vllm/cu129/installers"
+    local runfile_path="$installer_cache_dir/$CUDA_RUNFILE"
+    local runfile_url="https://developer.download.nvidia.com/compute/cuda/$CUDA_RELEASE/local_installers/$CUDA_RUNFILE"
+    local actual_md5=""
+
+    if [[ -x "$CUDA_INSTALL_DIR/bin/nvcc" ]]; then
+        installed_version="$(
+            "$CUDA_INSTALL_DIR/bin/nvcc" --version \
+                | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' \
+                | head -n1
+        )"
+    fi
+
+    if [[ "$installed_version" == "$CUDA_VERSION" ]]; then
+        log "CUDA Toolkit $CUDA_VERSION is already installed at $CUDA_INSTALL_DIR."
+        return
+    fi
+
+    ensure_download_tools
+    mkdir -p "$installer_cache_dir"
+
+    log "CUDA $CUDA_RELEASE does not officially qualify Ubuntu 26.04; using NVIDIA's standalone toolkit runfile with override mode."
+    log "Downloading $CUDA_RUNFILE (the download can resume if interrupted)..."
+    aria2c \
+        -x "$HTTP_CONNECTIONS" \
+        -s "$HTTP_CONNECTIONS" \
+        -k 1M \
+        -c \
+        --file-allocation=falloc \
+        --disk-cache=64M \
+        --max-tries=10 \
+        --retry-wait=3 \
+        --connect-timeout=30 \
+        --timeout=60 \
+        --console-log-level=warn \
+        --show-console-readout=true \
+        --summary-interval=0 \
+        --auto-file-renaming=false \
+        --allow-overwrite=true \
+        --dir="$installer_cache_dir" \
+        --out="$CUDA_RUNFILE" \
+        "$runfile_url"
+
+    actual_md5="$(md5sum "$runfile_path" | awk '{print $1}')"
+    if [[ "$actual_md5" != "$CUDA_RUNFILE_MD5" ]]; then
+        rm -f "$runfile_path" "${runfile_path}.aria2"
+        die "CUDA runfile checksum mismatch: expected $CUDA_RUNFILE_MD5, got $actual_md5."
+    fi
+
+    log "Installing CUDA Toolkit $CUDA_VERSION at $CUDA_INSTALL_DIR without installing an NVIDIA driver..."
+    as_root sh "$runfile_path" \
+        --silent \
+        --toolkit \
+        --toolkitpath="$CUDA_INSTALL_DIR" \
+        --override
+
+    [[ -x "$CUDA_INSTALL_DIR/bin/nvcc" ]] \
+        || die "CUDA installation completed, but $CUDA_INSTALL_DIR/bin/nvcc was not found."
+
+    installed_version="$(
+        "$CUDA_INSTALL_DIR/bin/nvcc" --version \
+            | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' \
+            | head -n1
+    )"
+    [[ "$installed_version" == "$CUDA_VERSION" ]] \
+        || die "Expected CUDA $CUDA_VERSION after installation, but nvcc reported ${installed_version:-unknown}."
+
+    rm -f "$runfile_path" "${runfile_path}.aria2"
+    log "CUDA Toolkit $CUDA_VERSION installed successfully; the downloaded runfile was removed."
 }
 
 install_uv() {
@@ -291,9 +386,19 @@ install_ffmpeg() {
 
 authorize_sudo_for_60_minutes
 
-step "Verify NVIDIA driver compatibility with CUDA 12.9 runtime wheels"
+step "Verify NVIDIA driver compatibility with CUDA $CUDA_VERSION"
 verify_nvidia_driver
-export PATH="$HOME/.local/bin:$PATH"
+
+step "Install or verify GCC $CUDA_HOST_GCC_MAJOR and CUDA Toolkit $CUDA_VERSION from the NVIDIA runfile"
+install_cuda_host_compiler
+install_cuda_toolkit
+export CUDA_HOME="$CUDA_INSTALL_DIR"
+export CC="/usr/bin/gcc-$CUDA_HOST_GCC_MAJOR"
+export CXX="/usr/bin/g++-$CUDA_HOST_GCC_MAJOR"
+export CUDAHOSTCXX="$CXX"
+export NVCC_CCBIN="$CXX"
+export PATH="$CUDA_HOME/bin:$HOME/.local/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 step "Install or verify uv"
 install_uv

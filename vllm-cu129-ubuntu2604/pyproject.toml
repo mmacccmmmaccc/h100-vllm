@@ -1,7 +1,7 @@
 [project]
 name = "vllm-cu129-ubuntu2604"
 version = "0.1.0"
-description = "vLLM CUDA 12.9 binary-runtime environment for Ubuntu 26.04"
+description = "vLLM CUDA 12.9 environment with runfile toolkit installation for Ubuntu 26.04"
 readme = "README.md"
 requires-python = "==3.12.*"
 dependencies = [

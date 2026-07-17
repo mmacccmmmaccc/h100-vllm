@@ -1,14 +1,25 @@
 # vLLM cu130 on Ubuntu 26.04
 
-Run `./setup.sh` on Ubuntu 26.04 x86_64. The script uses an existing CUDA
-Toolkit release from 13.3 onward within the 13.x series, or installs CUDA
-Toolkit 13.3 Update 1 by default. It accepts an installed cuDNN release from
-9.24 onward within the 9.x series, or installs cuDNN 9.24 by default.
-Use NVIDIA Linux driver 610.43.02 or newer for the fully supported CUDA 13.3
-configuration.
+This context installs CUDA Toolkit 13.0 Update 2 and runs the locked CUDA 13.0 builds of PyTorch and vLLM on Ubuntu 26.04 x86_64.
 
-The Python environment continues to use the CUDA 13.0 builds of PyTorch and
-vLLM because those are the published binary variants. NVIDIA's CUDA 13.x minor
-version compatibility permits those binaries to run with the CUDA 13.3 system
-toolkit and driver. The script also installs FFmpeg, then creates and opens the
-`vllm-cu130-ubuntu2604` virtual environment.
+NVIDIA does not officially qualify Ubuntu 26.04 for CUDA 13.0. The setup therefore uses NVIDIA's standalone 13.0.2 runfile in silent, toolkit-only override mode. It never installs or replaces the NVIDIA driver. The download is verified against NVIDIA's published MD5 checksum before execution and removed after successful installation.
+
+CUDA 13.0 supports Ubuntu 26.04's GCC 15 compiler. Because Ubuntu 26.04 uses Rust coreutils by default and its `dd` behavior can break NVIDIA runfile extraction, the setup installs `gnu-coreutils` and invokes the runfile with `/usr/bin/gnudd`. System cuDNN is not installed; the frozen Python lock supplies the runtime libraries required by the cu130 PyTorch and vLLM packages.
+
+Requirements:
+
+- Ubuntu 26.04 on x86_64
+- An NVIDIA GPU supported by vLLM
+- NVIDIA driver 580.95.05 or newer
+- Enough temporary disk space for the CUDA runfile, extraction, and toolkit installation
+- Internet access for system and Python dependencies
+
+Run:
+
+```bash
+./setup.sh
+```
+
+The setup verifies the NVIDIA driver, installs build prerequisites and CUDA Toolkit 13.0 at `/usr/local/cuda-13.0`, installs uv, FFmpeg 7, and libsndfile, synchronizes the frozen dependency lock, authenticates with Hugging Face, and opens a shell with the environment activated. It exports `CUDA_HOME`, compiler variables, `PATH`, `LD_LIBRARY_PATH`, and `VLLM_WSL2_ENABLE_PIN_MEMORY=1`.
+
+Because Ubuntu 26.04 is not an NVIDIA-qualified CUDA 13.0 platform, use Ubuntu 24.04 or a supported container if an extension remains incompatible with the newer operating-system libraries.
