@@ -21,7 +21,7 @@ INSTALL_TEMP_DIR=""
 SUDO_KEEPALIVE_PID=""
 CLEANED_UP=0
 STEP_CURRENT=0
-STEP_TOTAL=7
+STEP_TOTAL=6
 
 log() {
     printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
@@ -373,7 +373,6 @@ install_ffmpeg() {
     [[ "$(ffmpeg -version | awk 'NR == 1 { print $3 }')" == 7.* ]] || die "FFmpeg 7 installation verification failed."
 }
 
-step "Authorize sudo for up to 60 minutes"
 authorize_sudo_for_60_minutes
 
 step "Install or verify CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION"

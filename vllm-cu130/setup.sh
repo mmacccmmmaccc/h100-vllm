@@ -4,24 +4,18 @@ set -Eeuo pipefail
 
 SETUP_START_SECONDS=$SECONDS
 
-CUDA_VERSION="12.9"
-CUDA_RELEASE="12.9.1"
-CUDA_LOCAL_REPO_VERSION="12.9.1-575.57.08-1"
-CUDNN_VERSION="9.17.1"
 FFMPEG_VERSION="7.1.5"
-HTTP_CONNECTIONS="8"
 SUDO_AUTH_DURATION_SECONDS=3600
 SUDO_REFRESH_INTERVAL_SECONDS=50
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
-VENV_DIR="$PROJECT_DIR/vllm-cu129"
-export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
+VENV_DIR="$PROJECT_DIR/vllm-cu130"
 INSTALL_TEMP_DIR=""
 SUDO_KEEPALIVE_PID=""
 CLEANED_UP=0
 STEP_CURRENT=0
-STEP_TOTAL=6
+STEP_TOTAL=5
 
 log() {
     printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
@@ -164,7 +158,7 @@ trap 'handle_signal HUP 129' HUP
 
 # Keep future Hugging Face CLI/model usage on the regular HTTP path.
 export HF_HUB_DISABLE_XET=1
-export VLLM_WSL2_ENABLE_PIN_MEMORY=1
+export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
 unset HF_XET_NUM_CONCURRENT_RANGE_GETS
 unset HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY
 
@@ -176,134 +170,14 @@ command -v apt-get >/dev/null 2>&1 || die "apt-get was not found."
 [[ -f "$PROJECT_DIR/pyproject.toml" ]] || die "Missing $PROJECT_DIR/pyproject.toml."
 [[ -f "$PROJECT_DIR/uv.lock" ]] || die "Missing $PROJECT_DIR/uv.lock."
 
-case "${VERSION_ID:-}" in
-    22.04) CUDA_REPO_DISTRO="ubuntu2204" ;;
-    24.04) CUDA_REPO_DISTRO="ubuntu2404" ;;
-    *) die "CUDA 12.9 automated installation supports Ubuntu 22.04 or 24.04; found ${VERSION_ID:-unknown}." ;;
-esac
-
-[[ "$(uname -m)" == "x86_64" ]] || die "This CUDA installer currently supports x86_64 only."
+[[ "$(uname -m)" == "x86_64" ]] || die "This vLLM installer currently supports x86_64 only."
 
 ensure_download_tools() {
-    if ! command -v curl >/dev/null 2>&1 \
-        || ! command -v wget >/dev/null 2>&1 \
-        || ! command -v aria2c >/dev/null 2>&1; then
+    if ! command -v curl >/dev/null 2>&1; then
         log "Installing download prerequisites..."
         as_root apt-get update
-        apt_install aria2 ca-certificates curl wget
+        apt_install ca-certificates curl
     fi
-}
-
-install_cuda_and_cudnn() {
-    local nvcc_version=""
-    if command -v nvcc >/dev/null 2>&1; then
-        nvcc_version="$(nvcc --version | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' | head -n1)"
-    elif [[ -x "/usr/local/cuda-$CUDA_VERSION/bin/nvcc" ]]; then
-        nvcc_version="$CUDA_VERSION"
-    fi
-
-    local cudnn_installed=0
-    if dpkg-query -W -f='${Status}' cudnn9-cuda-12 2>/dev/null | grep -q 'ok installed'; then
-        cudnn_installed=1
-    fi
-
-    if [[ "$nvcc_version" == "$CUDA_VERSION" && "$cudnn_installed" == 1 ]]; then
-        log "CUDA Toolkit $CUDA_VERSION and cuDNN 9 are already installed."
-        return
-    fi
-
-    ensure_download_tools
-    log "Installing CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION from NVIDIA's local DEB repositories..."
-
-    local repo_name="cuda-repo-${CUDA_REPO_DISTRO}-12-9-local"
-    local repo_deb="${repo_name}_${CUDA_LOCAL_REPO_VERSION}_amd64.deb"
-    local cudnn_repo_name="cudnn-local-repo-${CUDA_REPO_DISTRO}-${CUDNN_VERSION}"
-    local cudnn_repo_deb="${cudnn_repo_name}_1.0-1_amd64.deb"
-    local download_dir
-    local installer_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/h100-vllm/cu129/installers"
-    local keyring
-    download_dir="$(mktemp -d)"
-    INSTALL_TEMP_DIR="$download_dir"
-    mkdir -p "$installer_cache_dir"
-
-    wget -qO "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
-        "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_REPO_DISTRO}/x86_64/cuda-${CUDA_REPO_DISTRO}.pin"
-    as_root install -m 644 \
-        "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
-        /etc/apt/preferences.d/cuda-repository-pin-600
-
-    if dpkg-query -W -f='${Status}' "$repo_name" 2>/dev/null | grep -q 'ok installed' \
-        && [[ -d "/var/$repo_name" ]]; then
-        log "Reusing the existing CUDA local repository in /var/$repo_name."
-    else
-        aria2c \
-            -x "$HTTP_CONNECTIONS" \
-            -s "$HTTP_CONNECTIONS" \
-            -k 1M \
-            -c \
-            --file-allocation=falloc \
-            --disk-cache=64M \
-            --max-tries=10 \
-            --retry-wait=3 \
-            --connect-timeout=30 \
-            --timeout=60 \
-            --console-log-level=warn \
-            --show-console-readout=true \
-            --summary-interval=0 \
-            --auto-file-renaming=false \
-            --allow-overwrite=true \
-            --dir="$installer_cache_dir" \
-            --out="$repo_deb" \
-            "https://developer.download.nvidia.com/compute/cuda/${CUDA_RELEASE}/local_installers/${repo_deb}"
-        as_root dpkg -i "$installer_cache_dir/$repo_deb"
-        rm -f "$installer_cache_dir/$repo_deb" "$installer_cache_dir/${repo_deb}.aria2"
-    fi
-
-    keyring="$(find "/var/$repo_name" -maxdepth 1 -type f -name 'cuda-*-keyring.gpg' -print -quit)"
-    [[ -n "$keyring" ]] || die "CUDA local repository keyring was not found in /var/$repo_name."
-    as_root cp "$keyring" /usr/share/keyrings/
-
-    if dpkg-query -W -f='${Status}' "$cudnn_repo_name" 2>/dev/null | grep -q 'ok installed' \
-        && [[ -d "/var/$cudnn_repo_name" ]]; then
-        log "Reusing the existing cuDNN local repository in /var/$cudnn_repo_name."
-    else
-        aria2c \
-            -x "$HTTP_CONNECTIONS" \
-            -s "$HTTP_CONNECTIONS" \
-            -k 1M \
-            -c \
-            --file-allocation=falloc \
-            --disk-cache=64M \
-            --max-tries=10 \
-            --retry-wait=3 \
-            --connect-timeout=30 \
-            --timeout=60 \
-            --console-log-level=warn \
-            --show-console-readout=true \
-            --summary-interval=0 \
-            --auto-file-renaming=false \
-            --allow-overwrite=true \
-            --dir="$installer_cache_dir" \
-            --out="$cudnn_repo_deb" \
-            "https://developer.download.nvidia.com/compute/cudnn/${CUDNN_VERSION}/local_installers/${cudnn_repo_deb}"
-        as_root dpkg -i "$installer_cache_dir/$cudnn_repo_deb"
-        rm -f "$installer_cache_dir/$cudnn_repo_deb" "$installer_cache_dir/${cudnn_repo_deb}.aria2"
-    fi
-
-    keyring="$(find "/var/$cudnn_repo_name" -maxdepth 1 -type f -name 'cudnn-*-keyring.gpg' -print -quit)"
-    [[ -n "$keyring" ]] || die "cuDNN local repository keyring was not found in /var/$cudnn_repo_name."
-    as_root cp "$keyring" /usr/share/keyrings/
-
-    as_root apt-get update
-    apt_install "cuda-toolkit-12-9" "cudnn9-cuda-12"
-
-    as_root env DEBIAN_FRONTEND=noninteractive apt-get remove -y --purge \
-        "$repo_name" "$cudnn_repo_name"
-    as_root rm -f /etc/apt/preferences.d/cuda-repository-pin-600
-    rm -rf "$download_dir"
-    INSTALL_TEMP_DIR=""
-
-    [[ -x "/usr/local/cuda-$CUDA_VERSION/bin/nvcc" ]] || die "CUDA installation completed, but nvcc was not found."
 }
 
 install_uv() {
@@ -373,10 +247,7 @@ install_ffmpeg() {
 
 authorize_sudo_for_60_minutes
 
-step "Install or verify CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION"
-install_cuda_and_cudnn
-export PATH="/usr/local/cuda-$CUDA_VERSION/bin:$HOME/.local/bin:$PATH"
-export LD_LIBRARY_PATH="/usr/local/cuda-$CUDA_VERSION/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+log "Skipping system CUDA Toolkit and cuDNN installation; the locked Python environment supplies its cu130 runtime libraries."
 
 step "Install or verify uv"
 install_uv
