@@ -169,6 +169,7 @@ trap 'handle_signal HUP 129' HUP
 
 # Keep future Hugging Face CLI/model usage on the regular HTTP path.
 export HF_HUB_DISABLE_XET=1
+export VLLM_WSL2_ENABLE_PIN_MEMORY=1
 export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
 unset HF_XET_NUM_CONCURRENT_RANGE_GETS
 unset HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY
