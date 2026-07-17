@@ -4,7 +4,9 @@ This context installs CUDA Toolkit 13.0 Update 2 and runs the locked CUDA 13.0 b
 
 NVIDIA does not officially qualify Ubuntu 26.04 for CUDA 13.0. The setup therefore uses NVIDIA's standalone 13.0.2 runfile in silent, toolkit-only override mode. It never installs or replaces the NVIDIA driver. The download is verified against NVIDIA's published MD5 checksum before execution and removed after successful installation.
 
-CUDA 13.0 supports Ubuntu 26.04's GCC 15 compiler. Because Ubuntu 26.04 uses Rust coreutils by default and its `dd` behavior can break NVIDIA runfile extraction, the setup installs `gnu-coreutils` and invokes the runfile with `/usr/bin/gnudd`. System cuDNN is not installed; the frozen Python lock supplies the runtime libraries required by the cu130 PyTorch and vLLM packages.
+CUDA 13.0 supports Ubuntu 26.04's GCC 15 compiler. Because Ubuntu 26.04 uses Rust coreutils by default and its `dd` behavior can break NVIDIA runfile extraction, the setup installs `gnu-coreutils` and invokes the runfile with `/usr/bin/gnudd`.
+
+Ubuntu 26.04 also replaced the `libxml2.so.2` ABI required by CUDA 13.0's embedded installer with `libxml2.so.16`. Setup downloads checksum-pinned Ubuntu 24.04 `libxml2.so.2` and ICU 74 packages, extracts them into a private cache, and exposes them only to the CUDA installer. It does not install or symlink the older ABI system-wide. System cuDNN is not installed; the frozen Python lock supplies the runtime libraries required by the cu130 PyTorch and vLLM packages.
 
 Requirements:
 
