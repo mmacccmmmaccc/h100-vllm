@@ -75,7 +75,7 @@ as_root() {
         "$@"
     else
         command -v sudo >/dev/null 2>&1 || die "sudo is required to install system packages."
-        sudo "$@"
+        sudo -n "$@"
     fi
 }
 
@@ -90,8 +90,9 @@ authorize_sudo_for_60_minutes() {
     fi
 
     command -v sudo >/dev/null 2>&1 || die "sudo is required to install system packages."
-    log "Enter your sudo password once; authorization will remain active for up to 60 minutes."
-    sudo -v
+    log "Verifying non-interactive passwordless sudo access..."
+    sudo -n -v >/dev/null 2>&1 \
+        || die "Passwordless sudo is required. Configure NOPASSWD for this user or run the setup as root."
 
     (
         deadline=$(( $(date +%s) + SUDO_AUTH_DURATION_SECONDS ))
