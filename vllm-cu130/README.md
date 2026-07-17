@@ -1,7 +1,5 @@
-# vLLM cu130
+# vLLM with CUDA Toolkit 13.0
 
-Run `./setup.sh` on Ubuntu to install uv, FFmpeg, and the locked vLLM/PyTorch
-cu130 environment. This variant does not download or install the system CUDA
-Toolkit or cuDNN; it requires a compatible NVIDIA driver.
-
-The script opens the `vllm-cu130` virtual environment after setup.
+Run `./setup.sh` on Ubuntu 22.04 or 24.04 to install CUDA Toolkit 13.0,
+cuDNN 9.19, FFmpeg, and the CUDA 13.0 build of vLLM. The script creates and
+opens the `vllm-cu130` virtual environment.
