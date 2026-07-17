@@ -7,6 +7,8 @@ SETUP_START_SECONDS=$SECONDS
 CUDA_VERSION="13.0"
 CUDA_RELEASE="13.0.2"
 CUDA_LOCAL_REPO_VERSION="13.0.2-580.95.05-1"
+ACTIVE_CUDA_VERSION=""
+ACTIVE_CUDA_HOME=""
 CUDNN_VERSION="9.19.0"
 CUDNN_PACKAGE_VERSION="9.19.0.56-1"
 FFMPEG_VERSION="7.1.5"
@@ -194,12 +196,43 @@ ensure_download_tools() {
     fi
 }
 
-install_cuda_and_cudnn() {
+detect_compatible_cuda_toolkit() {
+    local nvcc_path=""
+    local nvcc_real_path=""
     local nvcc_version=""
+    local -a nvcc_candidates=()
+
     if command -v nvcc >/dev/null 2>&1; then
-        nvcc_version="$(nvcc --version | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' | head -n1)"
-    elif [[ -x "/usr/local/cuda-$CUDA_VERSION/bin/nvcc" ]]; then
-        nvcc_version="$CUDA_VERSION"
+        nvcc_candidates+=("$(command -v nvcc)")
+    fi
+    [[ -x /usr/local/cuda/bin/nvcc ]] && nvcc_candidates+=(/usr/local/cuda/bin/nvcc)
+    [[ -x "/usr/local/cuda-$CUDA_VERSION/bin/nvcc" ]] \
+        && nvcc_candidates+=("/usr/local/cuda-$CUDA_VERSION/bin/nvcc")
+
+    shopt -s nullglob
+    nvcc_candidates+=(/usr/local/cuda-13*/bin/nvcc)
+    shopt -u nullglob
+
+    for nvcc_path in "${nvcc_candidates[@]}"; do
+        [[ -x "$nvcc_path" ]] || continue
+        nvcc_version="$("$nvcc_path" --version | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+        [[ "$nvcc_version" == 13.* ]] || continue
+
+        nvcc_real_path="$(readlink -f -- "$nvcc_path")"
+        ACTIVE_CUDA_VERSION="$nvcc_version"
+        ACTIVE_CUDA_HOME="$(cd -- "$(dirname -- "$nvcc_real_path")/.." && pwd -P)"
+        return 0
+    done
+
+    ACTIVE_CUDA_VERSION=""
+    ACTIVE_CUDA_HOME=""
+    return 1
+}
+
+install_cuda_and_cudnn() {
+    local cuda_installed=0
+    if detect_compatible_cuda_toolkit; then
+        cuda_installed=1
     fi
 
     local cudnn_installed=0
@@ -209,13 +242,20 @@ install_cuda_and_cudnn() {
         cudnn_installed=1
     fi
 
-    if [[ "$nvcc_version" == "$CUDA_VERSION" && "$cudnn_installed" == 1 ]]; then
-        log "CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION are already installed."
+    if (( cuda_installed == 1 && cudnn_installed == 1 )); then
+        log "Compatible CUDA Toolkit $ACTIVE_CUDA_VERSION and cuDNN $CUDNN_VERSION are already installed."
         return
     fi
 
     ensure_download_tools
-    log "Installing CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION from NVIDIA's local DEB repositories..."
+    if (( cuda_installed == 0 )); then
+        log "No CUDA 13.x toolkit was detected; installing the default CUDA Toolkit $CUDA_VERSION."
+    else
+        log "Using detected CUDA Toolkit $ACTIVE_CUDA_VERSION at $ACTIVE_CUDA_HOME."
+    fi
+    if (( cudnn_installed == 0 )); then
+        log "Installing cuDNN $CUDNN_VERSION."
+    fi
 
     local repo_name="cuda-repo-${CUDA_REPO_DISTRO}-13-0-local"
     local repo_deb="${repo_name}_${CUDA_LOCAL_REPO_VERSION}_amd64.deb"
@@ -224,88 +264,101 @@ install_cuda_and_cudnn() {
     local download_dir
     local installer_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/h100-vllm/vllm-cuda_toolkit_130/installers"
     local keyring
+    local -a packages=()
+    local -a repo_packages=()
     download_dir="$(mktemp -d)"
     INSTALL_TEMP_DIR="$download_dir"
     mkdir -p "$installer_cache_dir"
 
-    wget -qO "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
-        "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_REPO_DISTRO}/x86_64/cuda-${CUDA_REPO_DISTRO}.pin"
-    as_root install -m 644 \
-        "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
-        /etc/apt/preferences.d/cuda-repository-pin-600
+    if (( cuda_installed == 0 )); then
+        wget -qO "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
+            "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_REPO_DISTRO}/x86_64/cuda-${CUDA_REPO_DISTRO}.pin"
+        as_root install -m 644 \
+            "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
+            /etc/apt/preferences.d/cuda-repository-pin-600
 
-    if dpkg-query -W -f='${Status}' "$repo_name" 2>/dev/null | grep -q 'ok installed' \
-        && [[ -d "/var/$repo_name" ]]; then
-        log "Reusing the existing CUDA local repository in /var/$repo_name."
-    else
-        aria2c \
-            -x "$HTTP_CONNECTIONS" \
-            -s "$HTTP_CONNECTIONS" \
-            -k 1M \
-            -c \
-            --file-allocation=falloc \
-            --disk-cache=64M \
-            --max-tries=10 \
-            --retry-wait=3 \
-            --connect-timeout=30 \
-            --timeout=60 \
-            --console-log-level=warn \
-            --show-console-readout=true \
-            --summary-interval=0 \
-            --auto-file-renaming=false \
-            --allow-overwrite=true \
-            --dir="$installer_cache_dir" \
-            --out="$repo_deb" \
-            "https://developer.download.nvidia.com/compute/cuda/${CUDA_RELEASE}/local_installers/${repo_deb}"
-        as_root dpkg -i "$installer_cache_dir/$repo_deb"
-        rm -f "$installer_cache_dir/$repo_deb" "$installer_cache_dir/${repo_deb}.aria2"
+        if dpkg-query -W -f='${Status}' "$repo_name" 2>/dev/null | grep -q 'ok installed' \
+            && [[ -d "/var/$repo_name" ]]; then
+            log "Reusing the existing CUDA local repository in /var/$repo_name."
+        else
+            aria2c \
+                -x "$HTTP_CONNECTIONS" \
+                -s "$HTTP_CONNECTIONS" \
+                -k 1M \
+                -c \
+                --file-allocation=falloc \
+                --disk-cache=64M \
+                --max-tries=10 \
+                --retry-wait=3 \
+                --connect-timeout=30 \
+                --timeout=60 \
+                --console-log-level=warn \
+                --show-console-readout=true \
+                --summary-interval=0 \
+                --auto-file-renaming=false \
+                --allow-overwrite=true \
+                --dir="$installer_cache_dir" \
+                --out="$repo_deb" \
+                "https://developer.download.nvidia.com/compute/cuda/${CUDA_RELEASE}/local_installers/${repo_deb}"
+            as_root dpkg -i "$installer_cache_dir/$repo_deb"
+            rm -f "$installer_cache_dir/$repo_deb" "$installer_cache_dir/${repo_deb}.aria2"
+        fi
+
+        keyring="$(find "/var/$repo_name" -maxdepth 1 -type f -name 'cuda-*-keyring.gpg' -print -quit)"
+        [[ -n "$keyring" ]] || die "CUDA local repository keyring was not found in /var/$repo_name."
+        as_root cp "$keyring" /usr/share/keyrings/
+        packages+=("cuda-toolkit-13-0")
+        repo_packages+=("$repo_name")
     fi
 
-    keyring="$(find "/var/$repo_name" -maxdepth 1 -type f -name 'cuda-*-keyring.gpg' -print -quit)"
-    [[ -n "$keyring" ]] || die "CUDA local repository keyring was not found in /var/$repo_name."
-    as_root cp "$keyring" /usr/share/keyrings/
+    if (( cudnn_installed == 0 )); then
+        if dpkg-query -W -f='${Status}' "$cudnn_repo_name" 2>/dev/null | grep -q 'ok installed' \
+            && [[ -d "/var/$cudnn_repo_name" ]]; then
+            log "Reusing the existing cuDNN local repository in /var/$cudnn_repo_name."
+        else
+            aria2c \
+                -x "$HTTP_CONNECTIONS" \
+                -s "$HTTP_CONNECTIONS" \
+                -k 1M \
+                -c \
+                --file-allocation=falloc \
+                --disk-cache=64M \
+                --max-tries=10 \
+                --retry-wait=3 \
+                --connect-timeout=30 \
+                --timeout=60 \
+                --console-log-level=warn \
+                --show-console-readout=true \
+                --summary-interval=0 \
+                --auto-file-renaming=false \
+                --allow-overwrite=true \
+                --dir="$installer_cache_dir" \
+                --out="$cudnn_repo_deb" \
+                "https://developer.download.nvidia.com/compute/cudnn/${CUDNN_VERSION}/local_installers/${cudnn_repo_deb}"
+            as_root dpkg -i "$installer_cache_dir/$cudnn_repo_deb"
+            rm -f "$installer_cache_dir/$cudnn_repo_deb" "$installer_cache_dir/${cudnn_repo_deb}.aria2"
+        fi
 
-    if dpkg-query -W -f='${Status}' "$cudnn_repo_name" 2>/dev/null | grep -q 'ok installed' \
-        && [[ -d "/var/$cudnn_repo_name" ]]; then
-        log "Reusing the existing cuDNN local repository in /var/$cudnn_repo_name."
-    else
-        aria2c \
-            -x "$HTTP_CONNECTIONS" \
-            -s "$HTTP_CONNECTIONS" \
-            -k 1M \
-            -c \
-            --file-allocation=falloc \
-            --disk-cache=64M \
-            --max-tries=10 \
-            --retry-wait=3 \
-            --connect-timeout=30 \
-            --timeout=60 \
-            --console-log-level=warn \
-            --show-console-readout=true \
-            --summary-interval=0 \
-            --auto-file-renaming=false \
-            --allow-overwrite=true \
-            --dir="$installer_cache_dir" \
-            --out="$cudnn_repo_deb" \
-            "https://developer.download.nvidia.com/compute/cudnn/${CUDNN_VERSION}/local_installers/${cudnn_repo_deb}"
-        as_root dpkg -i "$installer_cache_dir/$cudnn_repo_deb"
-        rm -f "$installer_cache_dir/$cudnn_repo_deb" "$installer_cache_dir/${cudnn_repo_deb}.aria2"
+        keyring="$(find "/var/$cudnn_repo_name" -maxdepth 1 -type f -name 'cudnn-*-keyring.gpg' -print -quit)"
+        [[ -n "$keyring" ]] || die "cuDNN local repository keyring was not found in /var/$cudnn_repo_name."
+        as_root cp "$keyring" /usr/share/keyrings/
+        packages+=("cudnn9-cuda-13=$CUDNN_PACKAGE_VERSION")
+        repo_packages+=("$cudnn_repo_name")
     fi
-
-    keyring="$(find "/var/$cudnn_repo_name" -maxdepth 1 -type f -name 'cudnn-*-keyring.gpg' -print -quit)"
-    [[ -n "$keyring" ]] || die "cuDNN local repository keyring was not found in /var/$cudnn_repo_name."
-    as_root cp "$keyring" /usr/share/keyrings/
 
     as_root apt-get update
-    apt_install "cuda-toolkit-13-0" "cudnn9-cuda-13=$CUDNN_PACKAGE_VERSION"
+    apt_install "${packages[@]}"
 
     as_root env DEBIAN_FRONTEND=noninteractive apt-get remove -y --purge \
-        "$repo_name" "$cudnn_repo_name"
-    as_root rm -f /etc/apt/preferences.d/cuda-repository-pin-600
+        "${repo_packages[@]}"
+    if (( cuda_installed == 0 )); then
+        as_root rm -f /etc/apt/preferences.d/cuda-repository-pin-600
+    fi
     rm -rf "$download_dir"
     INSTALL_TEMP_DIR=""
 
-    [[ -x "/usr/local/cuda-$CUDA_VERSION/bin/nvcc" ]] || die "CUDA installation completed, but nvcc was not found."
+    detect_compatible_cuda_toolkit \
+        || die "CUDA installation completed, but a compatible CUDA 13.x nvcc was not found."
 }
 
 install_uv() {
@@ -398,10 +451,11 @@ install_ffmpeg() {
 
 authorize_sudo_for_60_minutes
 
-step "Install or verify CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION"
+step "Install or verify CUDA Toolkit 13.x (default $CUDA_VERSION) and cuDNN $CUDNN_VERSION"
 install_cuda_and_cudnn
-export PATH="/usr/local/cuda-$CUDA_VERSION/bin:$HOME/.local/bin:$PATH"
-export LD_LIBRARY_PATH="/usr/local/cuda-$CUDA_VERSION/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CUDA_HOME="$ACTIVE_CUDA_HOME"
+export PATH="$ACTIVE_CUDA_HOME/bin:$HOME/.local/bin:$PATH"
+export LD_LIBRARY_PATH="$ACTIVE_CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 step "Install or verify uv"
 install_uv
