@@ -10,7 +10,10 @@ CUDA_LOCAL_REPO_VERSION="13.0.2-580.95.05-1"
 ACTIVE_CUDA_VERSION=""
 ACTIVE_CUDA_HOME=""
 CUDNN_VERSION="9.19.0"
+CUDNN_MIN_VERSION="9.19.0"
 CUDNN_PACKAGE_VERSION="9.19.0.56-1"
+ACTIVE_CUDNN_VERSION=""
+ACTIVE_CUDNN_PACKAGE=""
 FFMPEG_VERSION="7.1.5"
 HTTP_CONNECTIONS="8"
 SUDO_AUTH_DURATION_SECONDS=3600
@@ -229,6 +232,30 @@ detect_compatible_cuda_toolkit() {
     return 1
 }
 
+detect_compatible_cudnn() {
+    local package_name=""
+    local package_version=""
+    local upstream_version=""
+
+    for package_name in cudnn9-cuda-13 libcudnn9-cuda-13; do
+        package_version="$(dpkg-query -W -f='${Version}' "$package_name" 2>/dev/null || true)"
+        [[ -n "$package_version" ]] || continue
+
+        # Ignore an optional Debian epoch when comparing the upstream version.
+        upstream_version="${package_version#*:}"
+        if dpkg --compare-versions "$upstream_version" ge "$CUDNN_MIN_VERSION" \
+            && dpkg --compare-versions "$upstream_version" lt 10; then
+            ACTIVE_CUDNN_VERSION="$package_version"
+            ACTIVE_CUDNN_PACKAGE="$package_name"
+            return 0
+        fi
+    done
+
+    ACTIVE_CUDNN_VERSION=""
+    ACTIVE_CUDNN_PACKAGE=""
+    return 1
+}
+
 install_cuda_and_cudnn() {
     local cuda_installed=0
     if detect_compatible_cuda_toolkit; then
@@ -236,14 +263,12 @@ install_cuda_and_cudnn() {
     fi
 
     local cudnn_installed=0
-    local cudnn_package_version=""
-    cudnn_package_version="$(dpkg-query -W -f='${Version}' cudnn9-cuda-13 2>/dev/null || true)"
-    if [[ "$cudnn_package_version" == "$CUDNN_PACKAGE_VERSION" ]]; then
+    if detect_compatible_cudnn; then
         cudnn_installed=1
     fi
 
     if (( cuda_installed == 1 && cudnn_installed == 1 )); then
-        log "Compatible CUDA Toolkit $ACTIVE_CUDA_VERSION and cuDNN $CUDNN_VERSION are already installed."
+        log "Compatible CUDA Toolkit $ACTIVE_CUDA_VERSION and cuDNN $ACTIVE_CUDNN_VERSION are already installed."
         return
     fi
 
@@ -254,7 +279,9 @@ install_cuda_and_cudnn() {
         log "Using detected CUDA Toolkit $ACTIVE_CUDA_VERSION at $ACTIVE_CUDA_HOME."
     fi
     if (( cudnn_installed == 0 )); then
-        log "Installing cuDNN $CUDNN_VERSION."
+        log "No supported cuDNN >=$CUDNN_MIN_VERSION,<10 was detected; installing cuDNN $CUDNN_VERSION."
+    else
+        log "Using detected cuDNN $ACTIVE_CUDNN_VERSION from $ACTIVE_CUDNN_PACKAGE."
     fi
 
     local repo_name="cuda-repo-${CUDA_REPO_DISTRO}-13-0-local"
@@ -359,6 +386,8 @@ install_cuda_and_cudnn() {
 
     detect_compatible_cuda_toolkit \
         || die "CUDA installation completed, but a compatible CUDA 13.x nvcc was not found."
+    detect_compatible_cudnn \
+        || die "cuDNN installation completed, but a supported cuDNN >=$CUDNN_MIN_VERSION,<10 was not found."
 }
 
 install_uv() {
@@ -451,7 +480,7 @@ install_ffmpeg() {
 
 authorize_sudo_for_60_minutes
 
-step "Install or verify CUDA Toolkit 13.x (default $CUDA_VERSION) and cuDNN $CUDNN_VERSION"
+step "Install or verify CUDA Toolkit 13.x (default $CUDA_VERSION) and cuDNN >=$CUDNN_MIN_VERSION,<10"
 install_cuda_and_cudnn
 export CUDA_HOME="$ACTIVE_CUDA_HOME"
 export PATH="$ACTIVE_CUDA_HOME/bin:$HOME/.local/bin:$PATH"
