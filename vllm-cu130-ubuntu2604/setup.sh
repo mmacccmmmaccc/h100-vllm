@@ -18,14 +18,11 @@ LIBICU_COMPAT_SHA256="d29c97a21a3e3254731cfac186e4d4e611e5e67d2c9a0430f6acfbd9ac
 LIBICU_COMPAT_URL="https://archive.ubuntu.com/ubuntu/pool/main/i/icu/$LIBICU_COMPAT_DEB"
 FFMPEG_VERSION="7.1.5"
 HTTP_CONNECTIONS="8"
-SUDO_AUTH_DURATION_SECONDS=3600
-SUDO_REFRESH_INTERVAL_SECONDS=50
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
 VENV_DIR="$PROJECT_DIR/vllm-cu130-ubuntu2604"
 export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
-SUDO_KEEPALIVE_PID=""
 INSTALL_TEMP_DIR=""
 CUDA_INSTALLER_COMPAT_LIB_DIR=""
 CLEANED_UP=0
@@ -79,67 +76,8 @@ die() {
     exit 1
 }
 
-as_root() {
-    if (( EUID == 0 )); then
-        "$@"
-    else
-        command -v sudo >/dev/null 2>&1 || die "sudo is required to install system packages."
-        sudo -n "$@"
-    fi
-}
-
 apt_install() {
-    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
-}
-
-authorize_sudo_for_60_minutes() {
-    if (( EUID == 0 )); then
-        log "Running as root; sudo authorization is not required."
-        return
-    fi
-
-    command -v sudo >/dev/null 2>&1 || die "sudo is required to install system packages."
-    log "Verifying non-interactive passwordless sudo access..."
-    sudo -n -v >/dev/null 2>&1 \
-        || die "Passwordless sudo is required. Configure NOPASSWD for this user or run the setup as root."
-
-    (
-        deadline=$(( $(date +%s) + SUDO_AUTH_DURATION_SECONDS ))
-        while :; do
-            now=$(date +%s)
-            wait_seconds=$((deadline - now))
-            if (( wait_seconds <= 0 )); then
-                sudo -k
-                exit 0
-            fi
-            if (( wait_seconds > SUDO_REFRESH_INTERVAL_SECONDS )); then
-                wait_seconds=$SUDO_REFRESH_INTERVAL_SECONDS
-            fi
-
-            sleep "$wait_seconds"
-            now=$(date +%s)
-            if (( now >= deadline )); then
-                sudo -k
-                exit 0
-            fi
-            sudo -n -v >/dev/null 2>&1 || exit 0
-        done
-    ) &
-    SUDO_KEEPALIVE_PID=$!
-}
-
-stop_sudo_authorization() {
-    if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
-        if kill -0 "$SUDO_KEEPALIVE_PID" 2>/dev/null; then
-            kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
-        fi
-        wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
-        SUDO_KEEPALIVE_PID=""
-    fi
-
-    if (( EUID != 0 )); then
-        sudo -k >/dev/null 2>&1 || true
-    fi
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
 }
 
 cleanup() {
@@ -148,7 +86,6 @@ cleanup() {
     CLEANED_UP=1
 
     trap - EXIT INT TERM HUP
-    stop_sudo_authorization
     if [[ -n "$INSTALL_TEMP_DIR" ]]; then
         rm -rf "$INSTALL_TEMP_DIR"
         INSTALL_TEMP_DIR=""
@@ -195,7 +132,7 @@ ensure_download_tools() {
         || ! command -v wget >/dev/null 2>&1 \
         || ! command -v aria2c >/dev/null 2>&1; then
         log "Installing download prerequisites..."
-        as_root apt-get update
+        sudo -n apt-get update
         apt_install aria2 ca-certificates curl wget
     fi
 }
@@ -236,7 +173,7 @@ install_cuda_prerequisites() {
         || ! command -v g++ >/dev/null 2>&1 \
         || [[ ! -x /usr/bin/gnudd ]]; then
         log "Installing CUDA host compiler and GNU coreutils prerequisites..."
-        as_root apt-get update
+        sudo -n apt-get update
         apt_install build-essential gnu-coreutils
     fi
 
@@ -366,7 +303,7 @@ install_cuda_toolkit() {
     log "Installing CUDA Toolkit $CUDA_VERSION at $CUDA_INSTALL_DIR without installing an NVIDIA driver..."
     INSTALL_TEMP_DIR="$(mktemp -d)"
     ln -s /usr/bin/gnudd "$INSTALL_TEMP_DIR/dd"
-    if ! as_root env \
+    if ! sudo -n env \
         PATH="$INSTALL_TEMP_DIR:$PATH" \
         LD_LIBRARY_PATH="$CUDA_INSTALLER_COMPAT_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
         sh "$runfile_path" \
@@ -437,7 +374,7 @@ install_libsndfile() {
 
     ensure_download_tools
     log "Installing libsndfile1..."
-    as_root apt-get update
+    sudo -n apt-get update
     apt_install libsndfile1
     dpkg-query -W -f='${Status}' libsndfile1 2>/dev/null \
         | grep -q 'ok installed' \
@@ -457,7 +394,7 @@ install_ffmpeg() {
 
     ensure_download_tools
     log "Building and installing FFmpeg $FFMPEG_VERSION from the official source release..."
-    as_root apt-get update
+    sudo -n apt-get update
     apt_install build-essential nasm pkg-config xz-utils ca-certificates
 
     local build_dir
@@ -475,16 +412,14 @@ install_ffmpeg() {
             --disable-static \
             --enable-shared
         make -j"$(nproc)"
-        as_root make install
+        sudo -n make install
     )
-    as_root ldconfig
+    sudo -n ldconfig
     rm -rf "$build_dir"
 
     command -v ffmpeg >/dev/null 2>&1 || die "FFmpeg installation completed, but ffmpeg was not found on PATH."
     [[ "$(ffmpeg -version | awk 'NR == 1 { print $3 }')" == 7.* ]] || die "FFmpeg 7 installation verification failed."
 }
-
-authorize_sudo_for_60_minutes
 
 step "Verify NVIDIA driver compatibility with CUDA $CUDA_VERSION"
 verify_nvidia_driver

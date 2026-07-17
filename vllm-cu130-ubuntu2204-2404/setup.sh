@@ -16,14 +16,11 @@ ACTIVE_CUDNN_VERSION=""
 ACTIVE_CUDNN_PACKAGE=""
 FFMPEG_VERSION="7.1.5"
 HTTP_CONNECTIONS="8"
-SUDO_AUTH_DURATION_SECONDS=3600
-SUDO_REFRESH_INTERVAL_SECONDS=50
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
 VENV_DIR="$PROJECT_DIR/vllm-cu130"
 INSTALL_TEMP_DIR=""
-SUDO_KEEPALIVE_PID=""
 CLEANED_UP=0
 STEP_CURRENT=0
 STEP_TOTAL=6
@@ -75,67 +72,8 @@ die() {
     exit 1
 }
 
-as_root() {
-    if (( EUID == 0 )); then
-        "$@"
-    else
-        command -v sudo >/dev/null 2>&1 || die "sudo is required to install system packages."
-        sudo -n "$@"
-    fi
-}
-
 apt_install() {
-    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
-}
-
-authorize_sudo_for_60_minutes() {
-    if (( EUID == 0 )); then
-        log "Running as root; sudo authorization is not required."
-        return
-    fi
-
-    command -v sudo >/dev/null 2>&1 || die "sudo is required to install system packages."
-    log "Verifying non-interactive passwordless sudo access..."
-    sudo -n -v >/dev/null 2>&1 \
-        || die "Passwordless sudo is required. Configure NOPASSWD for this user or run the setup as root."
-
-    (
-        deadline=$(( $(date +%s) + SUDO_AUTH_DURATION_SECONDS ))
-        while :; do
-            now=$(date +%s)
-            wait_seconds=$((deadline - now))
-            if (( wait_seconds <= 0 )); then
-                sudo -k
-                exit 0
-            fi
-            if (( wait_seconds > SUDO_REFRESH_INTERVAL_SECONDS )); then
-                wait_seconds=$SUDO_REFRESH_INTERVAL_SECONDS
-            fi
-
-            sleep "$wait_seconds"
-            now=$(date +%s)
-            if (( now >= deadline )); then
-                sudo -k
-                exit 0
-            fi
-            sudo -n -v >/dev/null 2>&1 || exit 0
-        done
-    ) &
-    SUDO_KEEPALIVE_PID=$!
-}
-
-stop_sudo_authorization() {
-    if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
-        if kill -0 "$SUDO_KEEPALIVE_PID" 2>/dev/null; then
-            kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
-        fi
-        wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
-        SUDO_KEEPALIVE_PID=""
-    fi
-
-    if (( EUID != 0 )); then
-        sudo -k >/dev/null 2>&1 || true
-    fi
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
 }
 
 cleanup() {
@@ -144,7 +82,6 @@ cleanup() {
     CLEANED_UP=1
 
     trap - EXIT INT TERM HUP
-    stop_sudo_authorization
     if [[ -n "$INSTALL_TEMP_DIR" ]]; then
         rm -rf "$INSTALL_TEMP_DIR"
         INSTALL_TEMP_DIR=""
@@ -196,7 +133,7 @@ ensure_download_tools() {
         || ! command -v wget >/dev/null 2>&1 \
         || ! command -v aria2c >/dev/null 2>&1; then
         log "Installing download prerequisites..."
-        as_root apt-get update
+        sudo -n apt-get update
         apt_install aria2 ca-certificates curl wget
     fi
 }
@@ -302,7 +239,7 @@ install_cuda_and_cudnn() {
     if (( cuda_installed == 0 )); then
         wget -qO "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
             "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_REPO_DISTRO}/x86_64/cuda-${CUDA_REPO_DISTRO}.pin"
-        as_root install -m 644 \
+        sudo -n install -m 644 \
             "$download_dir/cuda-${CUDA_REPO_DISTRO}.pin" \
             /etc/apt/preferences.d/cuda-repository-pin-600
 
@@ -329,13 +266,13 @@ install_cuda_and_cudnn() {
                 --dir="$installer_cache_dir" \
                 --out="$repo_deb" \
                 "https://developer.download.nvidia.com/compute/cuda/${CUDA_RELEASE}/local_installers/${repo_deb}"
-            as_root dpkg -i "$installer_cache_dir/$repo_deb"
+            sudo -n dpkg -i "$installer_cache_dir/$repo_deb"
             rm -f "$installer_cache_dir/$repo_deb" "$installer_cache_dir/${repo_deb}.aria2"
         fi
 
         keyring="$(find "/var/$repo_name" -maxdepth 1 -type f -name 'cuda-*-keyring.gpg' -print -quit)"
         [[ -n "$keyring" ]] || die "CUDA local repository keyring was not found in /var/$repo_name."
-        as_root cp "$keyring" /usr/share/keyrings/
+        sudo -n cp "$keyring" /usr/share/keyrings/
         packages+=("cuda-toolkit-13-0")
         repo_packages+=("$repo_name")
     fi
@@ -364,24 +301,24 @@ install_cuda_and_cudnn() {
                 --dir="$installer_cache_dir" \
                 --out="$cudnn_repo_deb" \
                 "https://developer.download.nvidia.com/compute/cudnn/${CUDNN_VERSION}/local_installers/${cudnn_repo_deb}"
-            as_root dpkg -i "$installer_cache_dir/$cudnn_repo_deb"
+            sudo -n dpkg -i "$installer_cache_dir/$cudnn_repo_deb"
             rm -f "$installer_cache_dir/$cudnn_repo_deb" "$installer_cache_dir/${cudnn_repo_deb}.aria2"
         fi
 
         keyring="$(find "/var/$cudnn_repo_name" -maxdepth 1 -type f -name 'cudnn-*-keyring.gpg' -print -quit)"
         [[ -n "$keyring" ]] || die "cuDNN local repository keyring was not found in /var/$cudnn_repo_name."
-        as_root cp "$keyring" /usr/share/keyrings/
+        sudo -n cp "$keyring" /usr/share/keyrings/
         packages+=("cudnn9-cuda-13=$CUDNN_PACKAGE_VERSION")
         repo_packages+=("$cudnn_repo_name")
     fi
 
-    as_root apt-get update
+    sudo -n apt-get update
     apt_install "${packages[@]}"
 
-    as_root env DEBIAN_FRONTEND=noninteractive apt-get remove -y --purge \
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get remove -y --purge \
         "${repo_packages[@]}"
     if (( cuda_installed == 0 )); then
-        as_root rm -f /etc/apt/preferences.d/cuda-repository-pin-600
+        sudo -n rm -f /etc/apt/preferences.d/cuda-repository-pin-600
     fi
     rm -rf "$download_dir"
     INSTALL_TEMP_DIR=""
@@ -433,7 +370,7 @@ install_libsndfile() {
 
     ensure_download_tools
     log "Installing libsndfile1..."
-    as_root apt-get update
+    sudo -n apt-get update
     apt_install libsndfile1
     dpkg-query -W -f='${Status}' libsndfile1 2>/dev/null \
         | grep -q 'ok installed' \
@@ -453,7 +390,7 @@ install_ffmpeg() {
 
     ensure_download_tools
     log "Building and installing FFmpeg $FFMPEG_VERSION from the official source release..."
-    as_root apt-get update
+    sudo -n apt-get update
     apt_install build-essential nasm pkg-config xz-utils ca-certificates
 
     local build_dir
@@ -471,16 +408,14 @@ install_ffmpeg() {
             --disable-static \
             --enable-shared
         make -j"$(nproc)"
-        as_root make install
+        sudo -n make install
     )
-    as_root ldconfig
+    sudo -n ldconfig
     rm -rf "$build_dir"
 
     command -v ffmpeg >/dev/null 2>&1 || die "FFmpeg installation completed, but ffmpeg was not found on PATH."
     [[ "$(ffmpeg -version | awk 'NR == 1 { print $3 }')" == 7.* ]] || die "FFmpeg 7 installation verification failed."
 }
-
-authorize_sudo_for_60_minutes
 
 step "Install or verify CUDA Toolkit 13.x (default $CUDA_VERSION) and cuDNN >=$CUDNN_MIN_VERSION,<10"
 install_cuda_and_cudnn
