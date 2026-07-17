@@ -4,16 +4,17 @@ set -Eeuo pipefail
 
 SETUP_START_SECONDS=$SECONDS
 
-CUDA_VERSION="12.9"
-CUDA_RELEASE="12.9.1"
-CUDA_LOCAL_REPO_VERSION="12.9.1-575.57.08-1"
-CUDNN_VERSION="9.17.1"
+CUDA_VERSION="13.0"
+CUDA_RELEASE="13.0.2"
+CUDA_LOCAL_REPO_VERSION="13.0.2-580.95.05-1"
+CUDNN_VERSION="9.19.0"
+CUDNN_PACKAGE_VERSION="9.19.0.56-1"
 FFMPEG_VERSION="7.1.5"
 HTTP_CONNECTIONS="8"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
-VENV_DIR="$PROJECT_DIR/.venv"
+VENV_DIR="$PROJECT_DIR/vllm-cu130"
 INSTALL_TEMP_DIR=""
 CLEANED_UP=0
 STEP_CURRENT=0
@@ -110,6 +111,7 @@ trap 'handle_signal HUP 129' HUP
 
 # Keep future Hugging Face CLI/model usage on the regular HTTP path.
 export HF_HUB_DISABLE_XET=1
+export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
 unset HF_XET_NUM_CONCURRENT_RANGE_GETS
 unset HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY
 
@@ -124,7 +126,7 @@ command -v apt-get >/dev/null 2>&1 || die "apt-get was not found."
 case "${VERSION_ID:-}" in
     22.04) CUDA_REPO_DISTRO="ubuntu2204" ;;
     24.04) CUDA_REPO_DISTRO="ubuntu2404" ;;
-    *) die "CUDA 12.9 automated installation supports Ubuntu 22.04 or 24.04; found ${VERSION_ID:-unknown}." ;;
+    *) die "CUDA 13.0 automated installation supports Ubuntu 22.04 or 24.04; found ${VERSION_ID:-unknown}." ;;
 esac
 
 [[ "$(uname -m)" == "x86_64" ]] || die "This CUDA installer currently supports x86_64 only."
@@ -148,24 +150,26 @@ install_cuda_and_cudnn() {
     fi
 
     local cudnn_installed=0
-    if dpkg-query -W -f='${Status}' cudnn9-cuda-12 2>/dev/null | grep -q 'ok installed'; then
+    local cudnn_package_version=""
+    cudnn_package_version="$(dpkg-query -W -f='${Version}' cudnn9-cuda-13 2>/dev/null || true)"
+    if [[ "$cudnn_package_version" == "$CUDNN_PACKAGE_VERSION" ]]; then
         cudnn_installed=1
     fi
 
     if [[ "$nvcc_version" == "$CUDA_VERSION" && "$cudnn_installed" == 1 ]]; then
-        log "CUDA Toolkit $CUDA_VERSION and cuDNN 9 are already installed."
+        log "CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION are already installed."
         return
     fi
 
     ensure_download_tools
     log "Installing CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION from NVIDIA's local DEB repositories..."
 
-    local repo_name="cuda-repo-${CUDA_REPO_DISTRO}-12-9-local"
+    local repo_name="cuda-repo-${CUDA_REPO_DISTRO}-13-0-local"
     local repo_deb="${repo_name}_${CUDA_LOCAL_REPO_VERSION}_amd64.deb"
     local cudnn_repo_name="cudnn-local-repo-${CUDA_REPO_DISTRO}-${CUDNN_VERSION}"
     local cudnn_repo_deb="${cudnn_repo_name}_1.0-1_amd64.deb"
     local download_dir
-    local installer_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/h100-vllm/cu129/installers"
+    local installer_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/h100-vllm/vllm-cuda_toolkit_130/installers"
     local keyring
     download_dir="$(mktemp -d)"
     INSTALL_TEMP_DIR="$download_dir"
@@ -240,7 +244,7 @@ install_cuda_and_cudnn() {
     as_root cp "$keyring" /usr/share/keyrings/
 
     as_root apt-get update
-    apt_install "cuda-toolkit-12-9" "cudnn9-cuda-12"
+    apt_install "cuda-toolkit-13-0" "cudnn9-cuda-13=$CUDNN_PACKAGE_VERSION"
 
     as_root env DEBIAN_FRONTEND=noninteractive apt-get remove -y --purge \
         "$repo_name" "$cudnn_repo_name"
