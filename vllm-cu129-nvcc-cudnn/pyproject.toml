@@ -1,5 +1,5 @@
 [project]
-name = "vllm-engine"
+name = "vllm-cu129"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"

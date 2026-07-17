@@ -2422,7 +2422,7 @@ requires-dist = [
 provides-extras = ["zen", "bench", "tensorizer", "fastsafetensors", "instanttensor", "runai", "audio", "video", "flashinfer", "helion", "grpc", "otel", "extra-quant"]
 
 [[package]]
-name = "vllm-engine"
+name = "vllm-cu129"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
