@@ -11,14 +11,17 @@ CUDNN_VERSION="9.19.0"
 CUDNN_PACKAGE_VERSION="9.19.0.56-1"
 FFMPEG_VERSION="7.1.5"
 HTTP_CONNECTIONS="8"
+SUDO_AUTH_DURATION_SECONDS=3600
+SUDO_REFRESH_INTERVAL_SECONDS=50
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
 VENV_DIR="$PROJECT_DIR/vllm-cu130"
 INSTALL_TEMP_DIR=""
+SUDO_KEEPALIVE_PID=""
 CLEANED_UP=0
 STEP_CURRENT=0
-STEP_TOTAL=5
+STEP_TOTAL=7
 
 log() {
     printf '[%s] [setup] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
@@ -80,12 +83,62 @@ apt_install() {
     as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
 }
 
+authorize_sudo_for_60_minutes() {
+    if (( EUID == 0 )); then
+        log "Running as root; sudo authorization is not required."
+        return
+    fi
+
+    command -v sudo >/dev/null 2>&1 || die "sudo is required to install system packages."
+    log "Enter your sudo password once; authorization will remain active for up to 60 minutes."
+    sudo -v
+
+    (
+        deadline=$(( $(date +%s) + SUDO_AUTH_DURATION_SECONDS ))
+        while :; do
+            now=$(date +%s)
+            wait_seconds=$((deadline - now))
+            if (( wait_seconds <= 0 )); then
+                sudo -k
+                exit 0
+            fi
+            if (( wait_seconds > SUDO_REFRESH_INTERVAL_SECONDS )); then
+                wait_seconds=$SUDO_REFRESH_INTERVAL_SECONDS
+            fi
+
+            sleep "$wait_seconds"
+            now=$(date +%s)
+            if (( now >= deadline )); then
+                sudo -k
+                exit 0
+            fi
+            sudo -n -v >/dev/null 2>&1 || exit 0
+        done
+    ) &
+    SUDO_KEEPALIVE_PID=$!
+}
+
+stop_sudo_authorization() {
+    if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+        if kill -0 "$SUDO_KEEPALIVE_PID" 2>/dev/null; then
+            kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+        fi
+        wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+        SUDO_KEEPALIVE_PID=""
+    fi
+
+    if (( EUID != 0 )); then
+        sudo -k >/dev/null 2>&1 || true
+    fi
+}
+
 cleanup() {
     local status=$?
     (( CLEANED_UP == 0 )) || return "$status"
     CLEANED_UP=1
 
     trap - EXIT INT TERM HUP
+    stop_sudo_authorization
     if [[ -n "$INSTALL_TEMP_DIR" ]]; then
         rm -rf "$INSTALL_TEMP_DIR"
         INSTALL_TEMP_DIR=""
@@ -272,6 +325,14 @@ install_uv() {
     command -v uv >/dev/null 2>&1 || die "uv installation did not produce an executable on PATH."
 }
 
+login_huggingface() {
+    local hf_cli="$VENV_DIR/bin/hf"
+
+    [[ -x "$hf_cli" ]] || die "The Hugging Face CLI was not found at $hf_cli."
+    log "Starting Hugging Face's interactive authentication flow."
+    "$hf_cli" auth login
+}
+
 install_ffmpeg() {
     local installed_version=""
     if command -v ffmpeg >/dev/null 2>&1; then
@@ -312,6 +373,9 @@ install_ffmpeg() {
     [[ "$(ffmpeg -version | awk 'NR == 1 { print $3 }')" == 7.* ]] || die "FFmpeg 7 installation verification failed."
 }
 
+step "Authorize sudo for up to 60 minutes"
+authorize_sudo_for_60_minutes
+
 step "Install or verify CUDA Toolkit $CUDA_VERSION and cuDNN $CUDNN_VERSION"
 install_cuda_and_cudnn
 export PATH="/usr/local/cuda-$CUDA_VERSION/bin:$HOME/.local/bin:$PATH"
@@ -325,6 +389,9 @@ install_ffmpeg
 step "Synchronize locked Python dependencies in $PROJECT_DIR"
 cd "$PROJECT_DIR"
 uv sync --frozen
+
+step "Authenticate with the Hugging Face CLI"
+login_huggingface
 
 step "Activate the virtual environment and open a CLI shell"
 [[ -f "$VENV_DIR/bin/activate" ]] || die "uv sync completed, but $VENV_DIR/bin/activate was not found."
