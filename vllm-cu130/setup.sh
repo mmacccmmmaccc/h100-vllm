@@ -158,6 +158,7 @@ trap 'handle_signal HUP 129' HUP
 
 # Keep future Hugging Face CLI/model usage on the regular HTTP path.
 export HF_HUB_DISABLE_XET=1
+export VLLM_WSL2_ENABLE_PIN_MEMORY=1
 export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
 unset HF_XET_NUM_CONCURRENT_RANGE_GETS
 unset HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY
@@ -199,10 +200,18 @@ install_uv() {
 
 login_huggingface() {
     local hf_cli="$VENV_DIR/bin/hf"
+    local hf_token=""
+    local login_status=0
 
     [[ -x "$hf_cli" ]] || die "The Hugging Face CLI was not found at $hf_cli."
-    log "Starting Hugging Face's interactive authentication flow."
-    "$hf_cli" auth login
+    IFS= read -r -s -p "Paste your Hugging Face access token: " hf_token
+    printf '\n'
+    [[ -n "$hf_token" ]] || die "A Hugging Face access token is required."
+
+    "$hf_cli" auth login --token "$hf_token" || login_status=$?
+    hf_token=""
+    unset hf_token
+    return "$login_status"
 }
 
 install_ffmpeg() {
