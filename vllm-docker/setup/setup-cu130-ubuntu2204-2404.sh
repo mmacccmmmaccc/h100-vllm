@@ -12,6 +12,9 @@ readonly HTTP_CONNECTIONS="8"
 readonly DOCKER_KEYRING="/etc/apt/keyrings/docker.asc"
 readonly DOCKER_SOURCE="/etc/apt/sources.list.d/docker.sources"
 readonly DOCKER_REPO="https://download.docker.com/linux/ubuntu"
+readonly NVIDIA_CONTAINER_KEYRING="/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
+readonly NVIDIA_CONTAINER_SOURCE="/etc/apt/sources.list.d/nvidia-container-toolkit.list"
+readonly NVIDIA_CONTAINER_REPO="https://nvidia.github.io/libnvidia-container"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DOCKERFILE="$SCRIPT_DIR/Dockerfile"
@@ -360,6 +363,54 @@ EOF
     sudo systemctl is-active --quiet docker || error "Docker did not start successfully."
 }
 
+install_nvidia_container_toolkit() {
+    local download_dir=""
+
+    log "Installing NVIDIA Container Toolkit prerequisites"
+    apt_install ca-certificates curl gnupg
+
+    download_dir="$(mktemp -d)"
+    INSTALL_TEMP_DIR="$download_dir"
+
+    log "Configuring the NVIDIA Container Toolkit repository"
+    curl -fsSL \
+        "$NVIDIA_CONTAINER_REPO/gpgkey" \
+        --output "$download_dir/nvidia-container-toolkit.key"
+    curl -fsSL \
+        "$NVIDIA_CONTAINER_REPO/stable/deb/nvidia-container-toolkit.list" \
+        --output "$download_dir/nvidia-container-toolkit.list"
+
+    sudo gpg --batch --yes --dearmor \
+        --output "$NVIDIA_CONTAINER_KEYRING" \
+        "$download_dir/nvidia-container-toolkit.key"
+    sed \
+        "s#deb https://#deb [signed-by=$NVIDIA_CONTAINER_KEYRING] https://#g" \
+        "$download_dir/nvidia-container-toolkit.list" \
+        >"$download_dir/nvidia-container-toolkit-configured.list"
+    sudo install -m 0644 \
+        "$download_dir/nvidia-container-toolkit-configured.list" \
+        "$NVIDIA_CONTAINER_SOURCE"
+
+    rm -rf "$download_dir"
+    INSTALL_TEMP_DIR=""
+
+    sudo apt-get update
+    apt_install nvidia-container-toolkit
+    command -v nvidia-ctk >/dev/null 2>&1 \
+        || error "nvidia-container-toolkit was installed, but nvidia-ctk was not found."
+
+    log "Configuring Docker to use the NVIDIA runtime"
+    sudo nvidia-ctk runtime configure --runtime=docker
+    sudo systemctl restart docker
+    sudo systemctl is-active --quiet docker \
+        || error "Docker did not restart successfully after NVIDIA runtime configuration."
+
+    sudo -iu "$TARGET_USER" docker info --format '{{json .Runtimes}}' \
+        | grep -q '"nvidia"' \
+        || error "Docker restarted, but the nvidia runtime was not registered."
+    log "Docker NVIDIA runtime is registered"
+}
+
 build_docker_image_as_target_user() {
     log "Starting a fresh login as $TARGET_USER so Docker group membership is active"
     sudo -iu "$TARGET_USER" docker info >/dev/null \
@@ -414,6 +465,9 @@ configure_cuda_environment
 
 log "Installing Docker"
 install_docker
+
+log "Installing and configuring NVIDIA Container Toolkit"
+install_nvidia_container_toolkit
 
 build_docker_image_as_target_user
 
