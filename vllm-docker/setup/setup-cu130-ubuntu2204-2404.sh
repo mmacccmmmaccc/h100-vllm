@@ -288,6 +288,36 @@ install_cuda_and_cudnn() {
         || error "cuDNN installation completed, but a supported cuDNN >=$CUDNN_MIN_VERSION,<10 was not found."
 }
 
+configure_cuda_environment() {
+    local cuda_profile="/etc/profile.d/cuda-13-0.sh"
+
+    [[ -x "$ACTIVE_CUDA_HOME/bin/nvcc" ]] \
+        || error "nvcc was not found at $ACTIVE_CUDA_HOME/bin/nvcc."
+
+    log "Configuring CUDA environment in $cuda_profile"
+    sudo tee "$cuda_profile" >/dev/null <<EOF
+# CUDA Toolkit 13.x environment, managed by h100-vllm setup.
+export CUDA_HOME="$ACTIVE_CUDA_HOME"
+case ":\$PATH:" in
+    *":\$CUDA_HOME/bin:"*) ;;
+    *) export PATH="\$CUDA_HOME/bin:\$PATH" ;;
+esac
+case ":\${LD_LIBRARY_PATH:-}:" in
+    *":\$CUDA_HOME/lib64:"*) ;;
+    *) export LD_LIBRARY_PATH="\$CUDA_HOME/lib64\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" ;;
+esac
+EOF
+    sudo chmod 0644 "$cuda_profile"
+
+    export CUDA_HOME="$ACTIVE_CUDA_HOME"
+    export PATH="$CUDA_HOME/bin:$PATH"
+    export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+    command -v nvcc >/dev/null 2>&1 \
+        || error "CUDA environment configuration completed, but nvcc is still not on PATH."
+    log "CUDA compiler available: $(nvcc --version | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+}
+
 install_docker() {
     log "Updating the APT package index"
     sudo apt-get update
@@ -380,6 +410,7 @@ login_huggingface() {
 
 log "Installing or verifying CUDA Toolkit 13.x and cuDNN"
 install_cuda_and_cudnn
+configure_cuda_environment
 
 log "Installing Docker"
 install_docker
