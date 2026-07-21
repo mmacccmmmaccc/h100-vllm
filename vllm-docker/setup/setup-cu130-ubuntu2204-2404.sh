@@ -16,7 +16,7 @@ readonly DOCKER_REPO="https://download.docker.com/linux/ubuntu"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DOCKERFILE="$SCRIPT_DIR/Dockerfile"
 DOCKER_BUILD_CONTEXT="$SCRIPT_DIR"
-DOCKER_IMAGE_TAG="${DOCKER_IMAGE_TAG:-vllm-cu130:latest}"
+DOCKER_IMAGE_TAG="${DOCKER_IMAGE_TAG:-vllm-audio:latest}"
 ACTIVE_CUDA_VERSION=""
 ACTIVE_CUDA_HOME=""
 ACTIVE_CUDNN_VERSION=""
@@ -343,6 +343,41 @@ build_docker_image_as_target_user() {
             "$DOCKER_BUILD_CONTEXT"
 }
 
+login_huggingface() {
+    local hf_token=""
+    local login_status=0
+    local target_home=""
+    local target_uid=""
+    local target_gid=""
+    local hf_home=""
+
+    target_home="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+    [[ -n "$target_home" ]] || error "Unable to determine the home directory for $TARGET_USER."
+    target_uid="$(id -u "$TARGET_USER")"
+    target_gid="$(id -g "$TARGET_USER")"
+    hf_home="$target_home/.cache/huggingface"
+
+    IFS= read -r -s -p "Paste your Hugging Face access token: " hf_token
+    printf '\n'
+    [[ -n "$hf_token" ]] || error "A Hugging Face access token is required."
+
+    sudo -u "$TARGET_USER" mkdir -p "$hf_home"
+    sudo -iu "$TARGET_USER" docker run --rm \
+        --user "$target_uid:$target_gid" \
+        --env HF_HOME=/hf-home \
+        --volume "$hf_home:/hf-home" \
+        --entrypoint hf \
+        "$DOCKER_IMAGE_TAG" \
+        auth login --token "$hf_token" || login_status=$?
+
+    hf_token=""
+    unset hf_token
+    (( login_status == 0 )) \
+        || error "Hugging Face authentication failed."
+
+    log "Hugging Face authentication saved in $hf_home"
+}
+
 log "Installing or verifying CUDA Toolkit 13.x and cuDNN"
 install_cuda_and_cudnn
 
@@ -351,7 +386,19 @@ install_docker
 
 build_docker_image_as_target_user
 
+log "Authenticating with Hugging Face"
+login_huggingface
+
 printf '\n\033[1;32mSetup completed successfully.\033[0m\n'
 printf 'CUDA Toolkit: %s (%s)\n' "$ACTIVE_CUDA_VERSION" "$ACTIVE_CUDA_HOME"
 printf 'cuDNN package: %s (%s)\n' "$ACTIVE_CUDNN_PACKAGE" "$ACTIVE_CUDNN_VERSION"
 printf 'Docker image: %s\n\n' "$DOCKER_IMAGE_TAG"
+
+if [[ -t 0 && -t 1 ]]; then
+    log "Opening a refreshed shell with Docker group access"
+    printf 'Docker commands can now be run without sudo. Run "exit" to return to the original shell.\n\n'
+    trap - EXIT INT TERM HUP
+    exec newgrp docker
+fi
+
+log "Non-interactive setup complete; start a new login session before running Docker without sudo"

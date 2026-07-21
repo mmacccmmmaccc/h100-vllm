@@ -1,5 +1,6 @@
 docker run --runtime nvidia --gpus all \
     --env-file .env \
+    --volume "$HOME/.cache/huggingface:/root/.cache/huggingface" \
     --ipc=host \
     vllm-audio \
     cyankiwi/gemma-4-12B-it-AWQ-INT4 \
