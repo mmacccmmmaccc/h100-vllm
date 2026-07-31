@@ -26,7 +26,6 @@ import torch
 DEFAULT_MODEL = "typhoon-ai/llama3.1-typhoon2-audio-8b-instruct"
 DEFAULT_OUTPUT_DIR = Path("llama3.1-typhoon2-audio-8b-instruct-NVFP4A16")
 SCHEME = "NVFP4A16"
-DEFAULT_IGNORE = ("lm_head",)
 
 
 def parse_args() -> argparse.Namespace:
@@ -110,6 +109,32 @@ def validate_output_dir(output_dir: Path) -> None:
         fail(f"output directory is not empty: {output_dir}")
 
 
+def language_model_linear_names(model: torch.nn.Module) -> tuple[str, list[str]]:
+    """Return the Llama backbone name and its quantizable Linear module names."""
+    candidates = [
+        (name, module)
+        for name, module in model.named_modules()
+        if module.__class__.__name__ == "LlamaForCausalLM"
+    ]
+    if len(candidates) != 1:
+        found = ", ".join(name or "<root>" for name, _ in candidates) or "none"
+        fail(
+            "expected exactly one LlamaForCausalLM language backbone; "
+            f"found {len(candidates)} ({found})"
+        )
+
+    backbone_name, backbone = candidates[0]
+    prefix = f"{backbone_name}." if backbone_name else ""
+    targets = [
+        f"{prefix}{name}"
+        for name, module in backbone.named_modules()
+        if name and isinstance(module, torch.nn.Linear) and name != "lm_head"
+    ]
+    if not targets:
+        fail(f"no Linear layers found under language backbone {backbone_name!r}")
+    return backbone_name or "<root>", targets
+
+
 def main() -> None:
     args = parse_args()
 
@@ -121,7 +146,7 @@ def main() -> None:
     print(f"Source:  {args.model}")
     print(f"Output:  {args.output_dir.resolve()}")
     print(f"Scheme:  {SCHEME} (weight-only)")
-    print(f"Ignored: {', '.join(DEFAULT_IGNORE)}")
+    print("Scope:   Llama language backbone only; audio stack remains dense")
 
     if args.dry_run:
         print("Dry run complete; no model was downloaded and no files were written.")
@@ -131,22 +156,28 @@ def main() -> None:
     # optional model dependencies (including fairseq) are installed.
     from llmcompressor import oneshot
     from llmcompressor.modifiers.quantization import QuantizationModifier
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoModel
 
     load_kwargs: dict[str, object] = {
         "torch_dtype": "auto",
         "trust_remote_code": True,
-        "device_map": args.device,
+        "device_map": {"": args.device},
         "low_cpu_mem_usage": True,
     }
     if args.revision:
         load_kwargs["revision"] = args.revision
 
-    model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
+    # Typhoon2AudioConfig registers its custom implementation with AutoModel,
+    # not AutoModelForCausalLM (despite containing a Llama causal LM).
+    model = AutoModel.from_pretrained(args.model, **load_kwargs)
+    backbone_name, targets = language_model_linear_names(model)
+    print(f"Language backbone: {backbone_name}")
+    print(f"Quantizing {len(targets)} language-model Linear layers")
+    print("Leaving the audio encoders, Q-Former, projector, and speech decoder dense")
     recipe = QuantizationModifier(
-        targets="Linear",
+        targets=targets,
         scheme=SCHEME,
-        ignore=list(DEFAULT_IGNORE),
+        ignore=["lm_head"],
     )
     oneshot(model=model, recipe=recipe)
 
