@@ -45,3 +45,5 @@ uv run python quantize_typhoon2_audio_nvfp4.py --dry-run
 Remove `--dry-run` to perform quantization. Authenticate with Hugging Face first
 when accessing gated models (`hf auth login` or set `HF_TOKEN`). The H100 can
 produce an NVFP4 checkpoint, but accelerated NVFP4 inference requires Blackwell.
+The environment includes `hf-transfer` for hosts that set
+`HF_HUB_ENABLE_HF_TRANSFER=1`.

@@ -6,6 +6,7 @@ requires-python = "==3.10.*"
 dependencies = [
     "accelerate>=1.6,<2",
     "fairseq==0.12.2",
+    "hf-transfer>=0.1.9,<1",
     "llmcompressor==0.6.0",
     "numpy>=1.26,<2",
     "sentencepiece>=0.2,<1",
