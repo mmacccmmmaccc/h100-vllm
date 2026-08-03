@@ -30,6 +30,9 @@ The printed interpreter must be
 directory, an old environment variable or activated environment is overriding
 the project environment.
 
+Transformers is pinned to 4.52.2 because that is the version required by the
+Typhoon 2 Audio model's custom code.
+
 ## Run
 
 ```bash
