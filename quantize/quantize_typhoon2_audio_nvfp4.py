@@ -135,6 +135,30 @@ def language_model_linear_names(model: torch.nn.Module) -> tuple[str, list[str]]
     return backbone_name or "<root>", targets
 
 
+def install_typhoon_transformers_compat() -> None:
+    """Restore generation.utils exports expected by Typhoon's remote code."""
+    from transformers import cache_utils, utils
+    from transformers.generation import utils as generation_utils
+    from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+
+    moved_exports = {
+        "is_deepspeed_zero3_enabled": is_deepspeed_zero3_enabled,
+        "is_torchdynamo_compiling": utils.is_torchdynamo_compiling,
+        "is_hqq_available": utils.is_hqq_available,
+        "QuantizedCacheConfig": cache_utils.QuantizedCacheConfig,
+        "DynamicCache": cache_utils.DynamicCache,
+        "EncoderDecoderCache": cache_utils.EncoderDecoderCache,
+    }
+    if hasattr(utils, "is_quanto_available"):
+        moved_exports["is_quanto_available"] = utils.is_quanto_available
+    elif hasattr(utils, "is_optimum_quanto_available"):
+        moved_exports["is_quanto_available"] = utils.is_optimum_quanto_available
+
+    for name, value in moved_exports.items():
+        if not hasattr(generation_utils, name):
+            setattr(generation_utils, name, value)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -157,6 +181,8 @@ def main() -> None:
     from llmcompressor import oneshot
     from llmcompressor.modifiers.quantization import QuantizationModifier
     from transformers import AutoModel
+
+    install_typhoon_transformers_compat()
 
     load_kwargs: dict[str, object] = {
         "torch_dtype": "auto",

@@ -31,7 +31,9 @@ directory, an old environment variable or activated environment is overriding
 the project environment.
 
 Transformers is pinned to 4.52.2 because that is the version required by the
-Typhoon 2 Audio model's custom code.
+Typhoon 2 Audio model's custom code. The Typhoon script also restores exports
+that its remote model file imports from their former `generation.utils`
+location.
 
 ## Run
 
