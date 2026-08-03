@@ -1,0 +1,28 @@
+[project]
+name = "h100-quantize"
+version = "0.1.0"
+description = "CUDA quantization utilities for Gemma 4 and Typhoon 2 Audio"
+requires-python = "==3.10.*"
+dependencies = [
+    "accelerate>=1.6,<2",
+    "fairseq==0.12.2",
+    "llmcompressor==0.8.1",
+    "numpy>=2,<2.4",
+    "sentencepiece>=0.2,<1",
+    "setuptools<81",
+    "torch==2.8.0",
+    "transformers>=4.51,<5",
+]
+
+[tool.uv]
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
